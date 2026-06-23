@@ -3986,7 +3986,15 @@ button.project-btn:disabled{
       showError(detail + ' Wilayah yang berhasil tetap ditampilkan di peta.');
     }
 
-    renderMap(points, tierData.totalTiers);
+    let boundaryData = null;
+    try {
+      boundaryData = await loadAdminBoundaryData(adminLevel, adminComponents);
+    } catch (errBoundary) {
+      console.warn('Boundary query gagal, peta titik tetap ditampilkan:', errBoundary);
+      showAdminMsg('Batas administrasi gagal dimuat, tetapi titik peta tetap ditampilkan.', 'warn');
+    }
+
+    renderMap(points, tierData.totalTiers, boundaryData);
   }
 
   // ── LULC (Land Use / Land Cover) CONFIG ───────────────────────────────
@@ -4256,8 +4264,6 @@ button.project-btn:disabled{
     });
 
     // ── OVERLAY: LULC Indonesia 10m (Hybrid Landcover, CSIRO) ───────────
-    // Tile cache ArcGIS publik (lihat LULC_TILE_URL di atas) — standar
-    // L.tileLayer biasa, bukan WMS, karena ini map service yang ter-cache.
     const lulcLayer = L.tileLayer(LULC_TILE_URL, {
       attribution: '&copy; CSIRO — Indonesia Hybrid Landcover 2020 (10 m)',
       maxNativeZoom: 16,
@@ -4266,27 +4272,23 @@ button.project-btn:disabled{
       opacity: 0.82
     });
 
-    // ── ADMIN BOUNDARY LAYERS: ArcGIS REST MapServer BIG (KSP) ───────────
-    // Tile dirender dinamis lewat operasi "export" (lihat ArcGISExportTileLayer
-    // di atas) — gambar dimuat via <img>, tidak ada isu CORS untuk tile itu sendiri.
-    const kabkotaLayer = new ArcGISExportTileLayer(BIG_MAPSERVER_URL, {
-      layerIndex: BIG_LAYER_INDEX.kabkota,
-      attribution: '&copy; BIG Indonesia (Kebijakan Satu Peta)',
-      opacity: 0.9
-    });
-    const kecamatanLayer = new ArcGISExportTileLayer(BIG_MAPSERVER_URL, {
-      layerIndex: BIG_LAYER_INDEX.kecamatan,
-      attribution: '&copy; BIG Indonesia (Kebijakan Satu Peta)',
-      opacity: 0.9
-    });
-    const desaLayer = new ArcGISExportTileLayer(BIG_MAPSERVER_URL, {
-      layerIndex: BIG_LAYER_INDEX.desa,
-      attribution: '&copy; BIG Indonesia (Kebijakan Satu Peta)',
-      opacity: 0.9
-    });
+    // ── ADMIN BOUNDARY LAYERS: GeoJSON hasil query BIG ───────────────────
+    const adminBoundaryLayers = {};
+    if (boundaryData && boundaryData.kabkota && Array.isArray(boundaryData.kabkota.features) && boundaryData.kabkota.features.length){
+      adminBoundaryLayers.kabkota = makeAdminBoundaryLayer('kabkota', boundaryData.kabkota);
+    }
+    if (boundaryData && boundaryData.kecamatan && Array.isArray(boundaryData.kecamatan.features) && boundaryData.kecamatan.features.length){
+      adminBoundaryLayers.kecamatan = makeAdminBoundaryLayer('kecamatan', boundaryData.kecamatan);
+    }
+    if (boundaryData && boundaryData.desa && Array.isArray(boundaryData.desa.features) && boundaryData.desa.features.length){
+      adminBoundaryLayers.desa = makeAdminBoundaryLayer('desa', boundaryData.desa);
+    }
 
     // Add default basemap
     osmLayer.addTo(leafletMap);
+
+    // Add available admin boundary layers by default so user immediately sees the analysis area.
+    Object.values(adminBoundaryLayers).forEach(layer => layer.addTo(leafletMap));
 
     // ── LAYER CONTROL ───────────────────────────────────────────────────
     const baseMapsCtrl = {
@@ -4296,106 +4298,32 @@ button.project-btn:disabled{
       'CartoDB Light':  cartoLightLayer
     };
     const overlayCtrl = {
-      '&#x1F33F; LULC Indonesia 10m':  lulcLayer,
-      '&#x1F534; Batas Kab/Kota':      kabkotaLayer,
-      '&#x1F7E0; Batas Kecamatan':     kecamatanLayer,
-      '&#x1F7E2; Batas Desa/Kel':      desaLayer
+      '🌿 LULC Indonesia 10m': lulcLayer
     };
+    if (adminBoundaryLayers.kabkota) overlayCtrl['🔴 Batas Kab/Kota'] = adminBoundaryLayers.kabkota;
+    if (adminBoundaryLayers.kecamatan) overlayCtrl['🟠 Batas Kecamatan'] = adminBoundaryLayers.kecamatan;
+    if (adminBoundaryLayers.desa) overlayCtrl['🟢 Batas Desa/Kel'] = adminBoundaryLayers.desa;
     L.control.layers(baseMapsCtrl, overlayCtrl, { position: 'topright', collapsed: true }).addTo(leafletMap);
 
-    // ── Identify: lacak layer batas admin yang sedang aktif ──────────────
-    // Klik peta akan query level paling detail yang aktif: desa > kecamatan > kab/kota.
-    const adminBoundaryLayers = {
-      kabkota:   { layer: kabkotaLayer,   layerIndex: BIG_LAYER_INDEX.kabkota,   label: 'Kab/Kota' },
-      kecamatan: { layer: kecamatanLayer, layerIndex: BIG_LAYER_INDEX.kecamatan, label: 'Kecamatan' },
-      desa:      { layer: desaLayer,      layerIndex: BIG_LAYER_INDEX.desa,      label: 'Desa/Kel' }
-    };
-    const adminLayerToKey = new Map([
-      [kabkotaLayer,   'kabkota'],
-      [kecamatanLayer, 'kecamatan'],
-      [desaLayer,      'desa']
-    ]);
-    const activeAdminWmsKeys = new Set();
+    // Keep click interaction lightweight: show the first active boundary name if present.
+    leafletMap.on('click', function(e) {
+      const active = [];
+      if (leafletMap.hasLayer(adminBoundaryLayers.desa)) active.push({ key: 'desa', label: 'Desa/Kel' });
+      if (leafletMap.hasLayer(adminBoundaryLayers.kecamatan)) active.push({ key: 'kecamatan', label: 'Kecamatan' });
+      if (leafletMap.hasLayer(adminBoundaryLayers.kabkota)) active.push({ key: 'kabkota', label: 'Kab/Kota' });
+      if (!active.length) return;
 
-    leafletMap.on('overlayadd', function(e) {
-      const key = adminLayerToKey.get(e.layer);
-      if (key) activeAdminWmsKeys.add(key);
-    });
-    leafletMap.on('overlayremove', function(e) {
-      const key = adminLayerToKey.get(e.layer);
-      if (key) activeAdminWmsKeys.delete(key);
-    });
+      const first = active[0];
+      const layer = adminBoundaryLayers[first.key];
+      if (!layer || !layer.toGeoJSON) return;
 
-    function getActiveAdminKey() {
-      if (activeAdminWmsKeys.has('desa')) return 'desa';
-      if (activeAdminWmsKeys.has('kecamatan')) return 'kecamatan';
-      if (activeAdminWmsKeys.has('kabkota')) return 'kabkota';
-      return null; // tidak ada layer batas admin yang aktif
-    }
-
-    // Susun URL operasi "identify" ArcGIS REST (setara GetFeatureInfo WMS)
-    function buildIdentifyUrl(layerIndex, latlng) {
-      const crs = leafletMap.options.crs || L.CRS.EPSG3857;
-      const pt = crs.project(latlng);
-      const b = leafletMap.getBounds();
-      const sw = crs.project(b.getSouthWest());
-      const ne = crs.project(b.getNorthEast());
-      const mapExtent = [sw.x, sw.y, ne.x, ne.y].join(',');
-      const size = leafletMap.getSize();
-      const geometry = JSON.stringify({ x: pt.x, y: pt.y, spatialReference: { wkid: 3857 } });
-      return BIG_MAPSERVER_URL + '/identify?f=json'
-        + '&geometry=' + encodeURIComponent(geometry)
-        + '&geometryType=esriGeometryPoint'
-        + '&sr=3857'
-        + '&layers=visible:' + layerIndex
-        + '&tolerance=3'
-        + '&mapExtent=' + mapExtent
-        + '&imageDisplay=' + Math.round(size.x) + ',' + Math.round(size.y) + ',96'
-        + '&returnGeometry=false';
-    }
-
-    // Klik peta → identify ke ArcGIS REST BIG pada level batas admin paling
-    // detail yang sedang aktif. CORS / fetch gagal ditangani tanpa crash.
-    leafletMap.on('click', async function(e) {
-      const key = getActiveAdminKey();
-      if (!key) return; // tidak ada layer batas admin aktif — tidak perlu query
-      const cfg = adminBoundaryLayers[key];
-      const url = buildIdentifyUrl(cfg.layerIndex, e.latlng);
-
-      showAdminMsg('Mengambil nama wilayah (' + cfg.label + ')…', 'loading');
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), ADMIN_IDENTIFY_TIMEOUT_MS);
-      try {
-        const resp = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const data = await resp.json();
-        hideAdminMsg();
-
-        const result = data && data.results && data.results[0];
-        if (!result) return; // tidak ada fitur tepat di titik klik — tidak perlu popup
-
-        const props = result.attributes || {};
-        let name = '';
-        for (const f of ADMIN_NAME_FIELDS) { if (props[f]) { name = props[f]; break; } }
-        if (!name) name = '(nama wilayah tidak ditemukan pada data)';
-
-        L.popup({ maxWidth: 260 })
-          .setLatLng(e.latlng)
-          .setContent(
-            '<b style="font-size:13px;">' + escapeHtml(String(name)) + '</b>' +
-            '<br><span style="color:#888; font-size:11px;">Level: ' + escapeHtml(cfg.label) + '</span>'
-          )
-          .openOn(leafletMap);
-      } catch (err) {
-        clearTimeout(timeoutId);
-        hideAdminMsg();
-        console.warn('Identify gagal (CORS/jaringan/timeout):', err);
-        L.popup({ maxWidth: 240 })
-          .setLatLng(e.latlng)
-          .setContent('<span style="font-size:12px; color:#888;">Nama wilayah tidak tersedia.</span>')
-          .openOn(leafletMap);
-      }
+      const feature = layer.toGeoJSON().features && layer.toGeoJSON().features[0];
+      const name = feature && feature.properties ? String(feature.properties.namobj || feature.properties.NAMOBJ || feature.properties.wadmkd || feature.properties.WADMKD || feature.properties.wadmkc || feature.properties.WADMKC || feature.properties.wadmkk || feature.properties.WADMKK || '').trim() : '';
+      if (!name) return;
+      L.popup({ maxWidth: 260 })
+        .setLatLng(e.latlng)
+        .setContent('<b style="font-size:13px;">' + escapeHtml(name) + '</b><br><span style="color:#888; font-size:11px;">' + escapeHtml(first.label) + '</span>')
+        .openOn(leafletMap);
     });
 
     // ── MARKERS ─────────────────────────────────────────────────────────
