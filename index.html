@@ -4134,17 +4134,7 @@ button.project-btn:disabled{
     let kabkotaGeo  = null; // disimpan untuk spatial fallback kecamatan & desa
     let kecamatanGeo = null; // disimpan untuk spatial query desa (level kecamatan)
 
-    // ── Helper: spatial query via bbox GeoJSON ───────────────────────────────
-    async function spatialQuery(layerIdx, bboxGeo) {
-      const bbox = featuresBbox(bboxGeo);
-      if (!bbox) return null;
-      return queryBIGLayer(layerIdx, {
-        where: 'OBJECTID > 0',
-        geometry: JSON.stringify({ xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax, spatialReference: { wkid: 4326 } }),
-        geometryType: 'esriGeometryEnvelope',
-        spatialRel: 'esriSpatialRelIntersects'
-      });
-    }
+    // ── Helper: spatial query via bbox GeoJSON — lihat fungsi spatialQuery di bawah seksi Desa ──
 
     // ── 1. Kab/Kota ────────────────────────────────────────────────────────
     if (uniqueKab.length > 0) {
@@ -4197,11 +4187,12 @@ button.project-btn:disabled{
       } else { errorCount++; }
     }
 
-    // ── 3. Desa ────────────────────────────────────────────────────────────
-    // Helper: ambil sub-GeoJSON yang hanya berisi kecamatan yang dianalisis
+    // ── Helper: ambil sub-GeoJSON yang hanya berisi kecamatan yang dianalisis
     // (berguna kalau kecamatanGeo diambil via spatial fallback kabkota → berisi semua kecamatan)
+    // Jika tidak ada match nama → kembalikan geo penuh (jangan null, agar scope minimal tersedia)
     function filterKecByAnalyzed(geo) {
-      if (!geo || !uniqueKec.length) return geo;
+      if (!geo) return null;
+      if (!uniqueKec.length) return geo;
       const filtered = geo.features.filter(f => {
         const name = getBIGName(f).toLowerCase().trim();
         return uniqueKec.some(k => {
@@ -4209,7 +4200,44 @@ button.project-btn:disabled{
           return name === kl || name.includes(kl) || kl.includes(name);
         });
       });
-      return filtered.length ? { type: 'FeatureCollection', features: filtered } : null;
+      // Jika tidak ada yang cocok, pakai semua kecamatan yang ada (lebih aman daripada null)
+      return { type: 'FeatureCollection', features: filtered.length ? filtered : geo.features };
+    }
+
+    // ── Helper: spatial query dengan beberapa strategi WHERE + fallback GET ──
+    async function spatialQuery(layerIdx, bboxGeo) {
+      const bbox = featuresBbox(bboxGeo);
+      if (!bbox) return null;
+      const geomObj = { xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax, spatialReference: { wkid: 4326 } };
+      const geomStr = JSON.stringify(geomObj);
+      const spatialParams = { geometry: geomStr, geometryType: 'esriGeometryEnvelope', spatialRel: 'esriSpatialRelIntersects' };
+
+      // Coba POST dengan beberapa variasi WHERE (server BIG kadang menolak klausa tertentu)
+      for (const w of ['OBJECTID > 0', 'FID >= 0', 'objectid > 0', 'fid >= 0']) {
+        const r = await queryBIGLayer(layerIdx, Object.assign({ where: w }, spatialParams));
+        if (r) return r;
+      }
+
+      // Fallback: GET tanpa WHERE (spatial filter saja) — bypass kemungkinan CORS POST issue
+      const qsParams = new URLSearchParams(Object.assign({
+        f: 'geojson', outSR: '4326', returnGeometry: 'true',
+        outFields: 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk'
+      }, spatialParams));
+      const getUrl = BIG_MAPSERVER_URL + '/' + layerIdx + '/query?' + qsParams.toString();
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), ADMIN_QUERY_TIMEOUT_MS);
+      try {
+        const resp = await fetch(getUrl, { signal: controller.signal });
+        clearTimeout(tid);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const json = await resp.json();
+        if (json && json.error) throw new Error('BIG: ' + JSON.stringify(json.error));
+        if (json && json.features && json.features.length) return json;
+      } catch (err) {
+        clearTimeout(tid);
+        console.warn('BIG spatial GET layer ' + layerIdx + ':', err.message);
+      }
+      return null;
     }
 
     if (adminLevel === 'desa' && uniqueDesa.length > 0) {
