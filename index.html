@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
 
@@ -4002,20 +4003,14 @@ button.project-btn:disabled{
   // seluruh Indonesia seperti sebelumnya. Hasilnya dirender dengan L.geoJSON().
   const BIG_MAPSERVER_URL = 'https://kspservices.big.go.id/satupeta/rest/services/PUBLIK/BATAS_WILAYAH/MapServer';
   const BIG_LAYER_INDEX = { kabkota: 2, kecamatan: 3, desa: 4 };
+  const GITHUB_DESA_ZIP_URL = 'https://raw.githubusercontent.com/hafdz621-netizen/batas-desa-simplify/main/Batas%20Kelurahan%20Desa.zip';
+  let _desaGitHubCache = null; // GeoJSON FeatureCollection cache (parsed once per session)
   const ADMIN_QUERY_TIMEOUT_MS = 20000; // lebih panjang dari identify karena response lebih besar
 
   // Warna batas administrasi (kab/kota & kecamatan; desa transparan)
   const ADMIN_STYLE_KAB  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 2.0 };
   const ADMIN_STYLE_KEC  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 1.5 };
   const ADMIN_STYLE_DESA = { fillColor: 'transparent', fillOpacity: 0, color: '#aaaaaa', weight: 0.8 };
-
-  // ── PENTING: skema field layer Desa (index 4) BERBEDA dari layer Kab/Kota
-  // & Kecamatan di server BIG ini. Layer Desa TIDAK punya WADMKD/WADMKC/WADMKK
-  // — field yang ada cuma: namobj, kdpumdes, kdpumkec, kdpumkab, kdpumprov,
-  // tipadm, objectid (sudah dicek langsung ke schema layer-nya di server BIG).
-  // Kalau outFields tetap minta WADMKD/WADMKC/WADMKK (field yang tidak ada),
-  // server BIG menolak request → ITULAH sebab layer Desa selalu gagal dimuat.
-  const DESA_OUT_FIELDS = 'namobj,kdpumdes,kdpumkec,kdpumkab,kdpumprov,tipadm,objectid';
 
   // ── Helper: query BIG via POST (menghindari batas panjang URL GET) ──────
   async function queryBIGLayer(layerIdx, params) {
@@ -4048,7 +4043,6 @@ button.project-btn:disabled{
     }
   }
 
-
   // ── Helper: SQL IN clause ────────────────────────────────────────────────
   function sqlIn(vals) {
     if (!vals || !vals.length) return "''";
@@ -4068,28 +4062,6 @@ button.project-btn:disabled{
       if (p[k]) return String(p[k]);
     }
     return '(nama tidak tersedia)';
-  }
-
-  // ── Helper: normalisasi nama wilayah (untuk fuzzy matching client-side) ─
-  // Strip prefix admin, lowercase, collapse whitespace
-  function normalizeName(s) {
-    return String(s || '')
-      .toLowerCase()
-      .trim()
-      .replace(/\s+/g, ' ')
-      .replace(/^(kecamatan|kabupaten|kab\.|kota|kelurahan|kel\.|desa)\s+/i, '');
-  }
-
-  // ── Helper: fuzzy match dua nama wilayah (toleran kapitalisasi & spasi) ─
-  function fuzzyMatch(nameA, nameB) {
-    const a = normalizeName(nameA), b = normalizeName(nameB);
-    return a === b || a.includes(b) || b.includes(a);
-  }
-
-  // ── Helper: SQL LIKE clause untuk field tertentu (server-side fuzzy) ────
-  function sqlLikeField(field, vals) {
-    if (!vals || !vals.length) return '1=0';
-    return vals.map(v => field + " LIKE '%" + String(v).replace(/'/g, "''") + "%'").join(' OR ');
   }
 
   // ── Helper: flatten koordinat dari GeoJSON geometry ─────────────────────
@@ -4142,69 +4114,6 @@ button.project-btn:disabled{
     });
   }
 
-  // ── Helper: ambil semua ring (Polygon/MultiPolygon) dari sebuah FeatureCollection
-  // GeoJSON dan ubah ke format Esri JSON rings, untuk dipakai sebagai geometri
-  // query spasial (esriGeometryPolygon) — BUKAN sekadar bounding box.
-  function geojsonToEsriRings(geojson) {
-    const rings = [];
-    function addPolygonCoords(coords) {
-      (coords || []).forEach(ring => { if (ring && ring.length >= 4) rings.push(ring); });
-    }
-    function walkGeometry(geom) {
-      if (!geom) return;
-      if (geom.type === 'Polygon') addPolygonCoords(geom.coordinates);
-      else if (geom.type === 'MultiPolygon') (geom.coordinates || []).forEach(addPolygonCoords);
-      else if (geom.type === 'GeometryCollection') (geom.geometries || []).forEach(walkGeometry);
-    }
-    (geojson.features || []).forEach(f => walkGeometry(f.geometry));
-    return rings;
-  }
-
-  // ── Spatial query Desa mengikuti GEOMETRI ASLI poligon Kecamatan ─────────
-  // CATATAN: Fungsi ini sudah tidak digunakan sebagai strategi utama karena
-  // sering gagal akibat payload geometry yang terlalu besar (ribuan vertex)
-  // atau timeout server. Strategi utama sekarang adalah namobj IN (attribute query).
-  // Fungsi ini dipertahankan sebagai referensi dan cadangan jika diperlukan kembali.
-  // kecGeoFiltered: FeatureCollection kecamatan (sudah difilter ke yang dianalisis).
-  async function spatialQueryDesaByKecamatanGeometry(kecGeoFiltered) {
-    if (!kecGeoFiltered) return null;
-    const rings = geojsonToEsriRings(kecGeoFiltered);
-    if (!rings.length) return null;
-    const geomObj = { rings: rings, spatialReference: { wkid: 4326 } };
-    const spatialParams = {
-      geometry: JSON.stringify(geomObj),
-      geometryType: 'esriGeometryPolygon',
-      spatialRel: 'esriSpatialRelIntersects',
-      outFields: DESA_OUT_FIELDS // PENTING: layer Desa tidak punya WADMKD/WADMKC/WADMKK
-    };
-
-    // Coba POST dengan beberapa variasi WHERE (server BIG kadang menolak klausa tertentu)
-    for (const w of ['OBJECTID > 0', 'FID >= 0', 'objectid > 0', 'fid >= 0']) {
-      const r = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({ where: w }, spatialParams));
-      if (r) return r;
-    }
-
-    // Fallback: GET tanpa WHERE (bypass kemungkinan isu CORS pada POST tertentu)
-    const qsParams = new URLSearchParams(Object.assign({
-      f: 'geojson', outSR: '4326', returnGeometry: 'true'
-    }, spatialParams));
-    const getUrl = BIG_MAPSERVER_URL + '/' + BIG_LAYER_INDEX.desa + '/query?' + qsParams.toString();
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), ADMIN_QUERY_TIMEOUT_MS);
-    try {
-      const resp = await fetch(getUrl, { signal: controller.signal });
-      clearTimeout(tid);
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const json = await resp.json();
-      if (json && json.error) throw new Error('BIG: ' + JSON.stringify(json.error));
-      if (json && json.features && json.features.length) return json;
-    } catch (err) {
-      clearTimeout(tid);
-      console.warn('BIG spatial(polygon) GET layer desa:', err.message);
-    }
-    return null;
-  }
-
   // ── Fungsi utama: muat batas administrasi terfilter dari BIG ────────────
   // adminComponents: [{desa, kecamatan, kabupaten}] dari lastAnalysis
   // adminLevel: 'desa' | 'kecamatan'
@@ -4215,31 +4124,23 @@ button.project-btn:disabled{
     const uniqueKab = [...new Set(adminComponents.map(a => a.kabupaten).filter(v => v && v.trim()))];
     const uniqueKec = [...new Set(adminComponents.map(a => a.kecamatan).filter(v => v && v.trim()))];
     const uniqueDesa = [...new Set(adminComponents.map(a => a.desa).filter(v => v && v.trim()))];
-    const isDesaMode = String(adminLevel).toLowerCase() === 'desa';
-    const showKabKec = !isDesaMode;
-    const showDesa = isDesaMode;
 
     const hasAdminContext = uniqueKab.length > 0 || uniqueKec.length > 0;
-    if (!hasAdminContext && !isDesaMode) {
+    if (!hasAdminContext && adminLevel !== 'desa') {
       showAdminMsg('Kolom Kabupaten/Kota dan Kecamatan tidak terisi — batas administrasi tidak dapat dimuat otomatis.', 'warn');
       return;
     }
 
-    showAdminMsg(
-      isDesaMode
-        ? 'Memuat batas Desa dan Kecamatan dari BIG (hanya wilayah teranalisis)…'
-        : 'Memuat batas Kab/Kota dan Kecamatan dari BIG (hanya wilayah teranalisis)…',
-      'loading'
-    );
+    showAdminMsg('Memuat batas administrasi dari BIG (hanya wilayah teranalisis)…', 'loading');
 
     let loadedCount = 0, errorCount = 0;
     let kabkotaGeo  = null; // disimpan untuk spatial fallback kecamatan & desa
-    let kecamatanGeo = null; // disimpan untuk spatial query desa (level desa)
+    let kecamatanGeo = null; // disimpan untuk spatial query desa (level kecamatan)
 
     // ── Helper: spatial query via bbox GeoJSON — lihat fungsi spatialQuery di bawah seksi Desa ──
 
     // ── 1. Kab/Kota ────────────────────────────────────────────────────────
-    if (showKabKec && uniqueKab.length > 0) {
+    if (uniqueKab.length > 0) {
       showAdminMsg('Memuat batas Kab/Kota (' + uniqueKab.join(', ') + ')…', 'loading');
       // Coba exact IN dulu, lalu LIKE (menangani "Kendal" vs "Kabupaten Kendal")
       let kabData = await queryBIGLayer(BIG_LAYER_INDEX.kabkota, { where: 'NAMOBJ IN (' + sqlIn(uniqueKab) + ')' });
@@ -4252,71 +4153,41 @@ button.project-btn:disabled{
     }
 
     // ── 2. Kecamatan ───────────────────────────────────────────────────────
+    // Strategi: nama → WADMKC+WADMKK → NAMOBJ → WADMKC saja →
+    //           jika semua gagal, spatial query dalam bbox kabkota (fallback paling aman)
+    showAdminMsg('Memuat batas Kecamatan…', 'loading');
     {
-      // Strategi (admin tertinggi → terendah):
-      //   A.  Query WADMKK (kabupaten) exact → dapat semua kec se-kabupaten
-      //   A2. Query WADMKK LIKE (handle "Kendal" vs "Kabupaten Kendal")
-      //       → filter client-side fuzzy ke uniqueKec (toleran spasi & kapital)
-      //   B.  Jika kabupaten kosong → LIKE query WADMKC / NAMOBJ per nama kecamatan
-      //   C.  Spatial fallback via bbox kabkota → filter client-side fuzzy
-      showAdminMsg('Memuat batas Kecamatan...', 'loading');
-      {
-        let kecData = null;
+      let kecData = null;
 
-        // ── A. Query dari level tertinggi: kabupaten → saring kecamatan client-side ──
+      // ── A. Query berbasis nama (hanya jika uniqueKec terisi) ──────────────
+      if (uniqueKec.length > 0) {
         if (uniqueKab.length > 0) {
-          // A1. WADMKK exact IN (paling cepat, ambil semua kec se-kabupaten)
           kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-            where: 'WADMKK IN (' + sqlIn(uniqueKab) + ')'
-          });
-          // A2. WADMKK LIKE (handle variasi spasi/kapital/prefiks di nama kabupaten)
-          if (!kecData) {
-            kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-              where: sqlLikeField('WADMKK', uniqueKab)
-            });
-          }
-          // Filter client-side ke kecamatan yang dianalisis (fuzzy: toleran spasi & kapital)
-          if (kecData && uniqueKec.length > 0) {
-            const filtered = kecData.features.filter(function(f) {
-              return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
-            });
-            // Jika ada match → pakai hasil filter; jika nol match → pakai semua kec se-kabupaten
-            if (filtered.length > 0) kecData = { type: 'FeatureCollection', features: filtered };
-          }
-        }
-
-        // ── B. Kabupaten kosong → query langsung per nama kecamatan (LIKE fuzzy server-side) ──
-        if (!kecData && uniqueKec.length > 0) {
-          kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-            where: sqlLikeField('WADMKC', uniqueKec)
+            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND WADMKK IN (' + sqlIn(uniqueKab) + ')'
           });
           if (!kecData) {
+            const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
             kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-              where: sqlLikeField('NAMOBJ', uniqueKec)
+              where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
             });
           }
         }
-
-        // ── C. Spatial fallback: kecamatan dalam bbox kabkota ─────────────────
-        // Dipakai jika semua query nama gagal (CORS, field tidak ada, dll.)
-        if (!kecData && kabkotaGeo) {
-          showAdminMsg('Memuat batas Kecamatan (spatial via Kab/Kota)...', 'loading');
-          kecData = await spatialQuery(BIG_LAYER_INDEX.kecamatan, kabkotaGeo);
-          // Tetap filter client-side fuzzy setelah spatial fallback
-          if (kecData && uniqueKec.length > 0) {
-            const filtered = kecData.features.filter(function(f) {
-              return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
-            });
-            if (filtered.length > 0) kecData = { type: 'FeatureCollection', features: filtered };
-          }
-        }
-
-        if (kecData) {
-          kecamatanGeo = kecData;
-          const lyr = makeBoundaryLayer(kecData, ADMIN_STYLE_KEC, 'Kecamatan');
-          if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E0; Batas Kecamatan'); loadedCount++; }
-        } else { errorCount++; }
+        if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'NAMOBJ IN (' + sqlIn(uniqueKec) + ')' });
+        if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
       }
+
+      // ── B. Spatial fallback: kecamatan dalam bbox kabkota ─────────────────
+      // Dipakai jika: kolom Kecamatan kosong di data, atau nama tidak cocok dengan BIG
+      if (!kecData && kabkotaGeo) {
+        showAdminMsg('Memuat batas Kecamatan (spatial via Kab/Kota)…', 'loading');
+        kecData = await spatialQuery(BIG_LAYER_INDEX.kecamatan, kabkotaGeo);
+      }
+
+      if (kecData) {
+        kecamatanGeo = kecData;
+        const lyr = makeBoundaryLayer(kecData, ADMIN_STYLE_KEC, 'Kecamatan');
+        if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E0; Batas Kecamatan'); loadedCount++; }
+      } else { errorCount++; }
     }
 
     // ── Helper: ambil sub-GeoJSON yang hanya berisi kecamatan yang dianalisis
@@ -4325,155 +4196,134 @@ button.project-btn:disabled{
     function filterKecByAnalyzed(geo) {
       if (!geo) return null;
       if (!uniqueKec.length) return geo;
-      const filtered = geo.features.filter(function(f) {
-        return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
+      const filtered = geo.features.filter(f => {
+        const name = getBIGName(f).toLowerCase().trim();
+        return uniqueKec.some(k => {
+          const kl = k.toLowerCase().trim();
+          return name === kl || name.includes(kl) || kl.includes(name);
+        });
       });
       // Jika tidak ada yang cocok, pakai semua kecamatan yang ada (lebih aman daripada null)
       return { type: 'FeatureCollection', features: filtered.length ? filtered : geo.features };
     }
 
     // ── Helper: spatial query dengan beberapa strategi WHERE + fallback GET ──
-    // outFieldsOverride: opsional — dipakai untuk layer yang skema field-nya
-    // berbeda (misal layer Desa, lihat DESA_OUT_FIELDS di atas).
-    async function spatialQuery(layerIdx, bboxGeo, outFieldsOverride) {
+    async function spatialQuery(layerIdx, bboxGeo) {
       const bbox = featuresBbox(bboxGeo);
       if (!bbox) return null;
-      const outFieldsToUse = outFieldsOverride || 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk';
       const geomObj = { xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax, spatialReference: { wkid: 4326 } };
       const geomStr = JSON.stringify(geomObj);
-      const spatialParams = { geometry: geomStr, geometryType: 'esriGeometryEnvelope', spatialRel: 'esriSpatialRelIntersects', outFields: outFieldsToUse };
+      const spatialParams = { geometry: geomStr, geometryType: 'esriGeometryEnvelope', spatialRel: 'esriSpatialRelIntersects' };
 
-      // 1) POST via queryBIGLayer with spatial params
-      let json = null;
-      try {
-        json = await queryBIGLayer(layerIdx, Object.assign({}, spatialParams, { where: '1=1' }));
-      } catch (err) {
-        console.warn('BIG spatial(post) layer ' + layerIdx + ':', err.message);
+      // Coba POST dengan beberapa variasi WHERE (server BIG kadang menolak klausa tertentu)
+      for (const w of ['OBJECTID > 0', 'FID >= 0', 'objectid > 0', 'fid >= 0']) {
+        const r = await queryBIGLayer(layerIdx, Object.assign({ where: w }, spatialParams));
+        if (r) return r;
       }
-      if (json && json.features && json.features.length) return json;
 
-      // 2) GET fallback: queryBIGLayer URL langsung (beberapa proxy BIG lebih menerima GET)
+      // Fallback: GET tanpa WHERE (spatial filter saja) — bypass kemungkinan CORS POST issue
+      const qsParams = new URLSearchParams(Object.assign({
+        f: 'geojson', outSR: '4326', returnGeometry: 'true',
+        outFields: 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk'
+      }, spatialParams));
+      const getUrl = BIG_MAPSERVER_URL + '/' + layerIdx + '/query?' + qsParams.toString();
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), ADMIN_QUERY_TIMEOUT_MS);
       try {
-        const controller = new AbortController();
-        const tid = setTimeout(() => controller.abort(), 12000);
-        const base = BIG_LAYER_URLS[layerIdx];
-        const qs = new URLSearchParams();
-        qs.set('f', 'json');
-        qs.set('where', '1=1');
-        qs.set('returnGeometry', 'true');
-        qs.set('outFields', outFieldsToUse);
-        qs.set('geometry', geomStr);
-        qs.set('geometryType', 'esriGeometryEnvelope');
-        qs.set('spatialRel', 'esriSpatialRelIntersects');
-        qs.set('inSR', '4326');
-        qs.set('outSR', '4326');
-        const getUrl = base + '/query?' + qs.toString();
         const resp = await fetch(getUrl, { signal: controller.signal });
         clearTimeout(tid);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const json2 = await resp.json();
-        if (json2 && json2.error) throw new Error('BIG: ' + JSON.stringify(json2.error));
-        if (json2 && json2.features && json2.features.length) return json2;
+        const json = await resp.json();
+        if (json && json.error) throw new Error('BIG: ' + JSON.stringify(json.error));
+        if (json && json.features && json.features.length) return json;
       } catch (err) {
-        console.warn('BIG spatial(GET) layer ' + layerIdx + ':', err.message);
+        clearTimeout(tid);
+        console.warn('BIG spatial GET layer ' + layerIdx + ':', err.message);
       }
       return null;
     }
 
-    // ── Helper: bangun object parameter spatial extent (esriGeometryEnvelope) ────
-    // Mengembalikan { geometry, geometryType, spatialRel } yang bisa di-merge ke
-    // params queryBIGLayer lewat Object.assign — ringan (cukup 4 angka bbox, tidak
-    // butuh ribuan vertex), namun tetap membatasi scope spasial query agar desa
-    // dengan nama sama di luar kecamatan yang dianalisis tidak ikut terambil.
-    function buildExtentParams(geo) {
-      const bbox = featuresBbox(geo);
-      if (!bbox) return null;
-      return {
-        geometry: JSON.stringify({
-          xmin: bbox.xmin, ymin: bbox.ymin,
-          xmax: bbox.xmax, ymax: bbox.ymax,
-          spatialReference: { wkid: 4326 }
-        }),
-        geometryType: 'esriGeometryEnvelope',
-        spatialRel: 'esriSpatialRelIntersects'
-      };
-    }
-
-    // ── 3. Desa ────────────────────────────────────────────────────────────
-    // Hanya dimuat saat skala peta = Desa.
-    if (showDesa && uniqueDesa.length > 0) {
-      // Level desa: tampilkan HANYA desa yang teranalisis.
-      // Layer 4 (Desa) BIG hanya punya field "namobj" untuk nama wilayah — tidak ada
-      // WADMKD/WADMKC/WADMKK. Strategi: kombinasikan namobj IN (attribute query)
-      // dengan spatial extent kecamatan (bbox ringan, bukan vertex penuh) agar
-      // desa bernama sama di kecamatan lain tidak ikut terambil.
+    if (adminLevel === 'desa' && uniqueDesa.length > 0) {
+      // Level desa: tampilkan HANYA desa yang teranalisis
       showAdminMsg('Memuat batas Desa (teranalisis saja)…', 'loading');
       let desaData = null;
-
-      const scopeKec = kecamatanGeo ? filterKecByAnalyzed(kecamatanGeo) : null;
-      const extentP  = scopeKec ? buildExtentParams(scopeKec) : null;
-
-      // ── A. namobj IN + spatial extent (GABUNGAN — paling presisi) ────────────
-      // Satu request POST: attribute filter (nama desa tepat) + bbox kecamatan.
-      // Eliminasi desa homonym di kecamatan lain tanpa perlu vertex polygon.
-      if (extentP) {
-        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({
-          where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
-          outFields: DESA_OUT_FIELDS
-        }, extentP));
-      }
-
-      // ── B. namobj IN tanpa spatial (fallback jika server menolak kombinasi) ──
-      if (!desaData) {
+      if (uniqueKec.length > 0) {
         desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-          where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
-          outFields: DESA_OUT_FIELDS
+          where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')'
         });
       }
-
-      // ── C. LIKE + spatial extent (toleran prefiks "Desa "/"Kelurahan "/kapital) ─
-      if (!desaData && extentP) {
-        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({
-          where: sqlLikeField('namobj', uniqueDesa),
-          outFields: DESA_OUT_FIELDS
-        }, extentP));
-      }
-
-      // ── D. LIKE tanpa spatial ─────────────────────────────────────────────────
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')' });
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'NAMOBJ IN (' + sqlIn(uniqueDesa) + ')' });
+      // Spatial fallback: gunakan bbox kecamatan yang dianalisis (bukan seluruh kabkota)
       if (!desaData) {
-        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-          where: sqlLikeField('namobj', uniqueDesa),
-          outFields: DESA_OUT_FIELDS
-        });
+        const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
+        if (scopeGeo) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
       }
-
-      // ── E. Spatial extent saja + saring client-side (cadangan terakhir) ──────
-      // Dipakai jika nama di data sama sekali tidak cocok dengan namobj server.
-      if (!desaData && scopeKec) {
-        showAdminMsg('Memuat batas Desa (spatial extent kecamatan, filter klien)…', 'loading');
-        desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeKec, DESA_OUT_FIELDS);
-        if (desaData && uniqueDesa.length > 0) {
-          const filteredByName = desaData.features.filter(function(f) {
-            return uniqueDesa.some(function(d) { return fuzzyMatch(getBIGName(f), d); });
-          });
-          if (filteredByName.length > 0) desaData = { type: 'FeatureCollection', features: filteredByName };
-        }
-      }
-
       if (desaData) {
         const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
         if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
-      } else { errorCount++; }
-    } else if (isDesaMode) {
-      console.info('UrbanTara: skala Desa aktif, tetapi nama desa belum tersedia; layer Desa dilewati.');
+      } else {
+        // Final fallback: GitHub ZIP TopoJSON
+        showAdminMsg('BIG desa gagal, mencoba GitHub TopoJSON…', 'loading');
+        const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo);
+        if (ghData) {
+          const lyr = makeBoundaryLayer(ghData, ADMIN_STYLE_DESA, 'Desa/Kel (GitHub)');
+          if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
+        } else { errorCount++; }
+      }
+
+    } else if (adminLevel === 'kecamatan') {
+      // Level kecamatan: tampilkan desa HANYA dalam kecamatan yang dianalisis
+      // Tidak boleh pakai bbox kabkota (terlalu luas, bisa kena limit fitur server BIG)
+      if (uniqueKec.length > 0) {
+        showAdminMsg('Memuat batas Desa dalam kecamatan teranalisis…', 'loading');
+        let desaData = null;
+
+        // A. Query WADMKC (field nama kecamatan di layer desa) — paling presisi, 1 request
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
+
+        // B. Tambah konteks kabkota (WADMKK) untuk menghindari nama kecamatan duplikat
+        if (!desaData && uniqueKab.length > 0) {
+          const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
+          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
+          });
+        }
+
+        // C. Spatial fallback — hanya kecamatan yang dianalisis (bukan bbox penuh kabkota)
+        if (!desaData && kecamatanGeo) {
+          const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
+          if (scopeGeo) {
+            showAdminMsg('Memuat batas Desa (spatial per kecamatan teranalisis)…', 'loading');
+            desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
+          }
+        }
+
+        if (desaData) {
+          const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
+          if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
+        } else {
+          // Final fallback: GitHub ZIP TopoJSON
+          showAdminMsg('BIG desa gagal, mencoba GitHub TopoJSON…', 'loading');
+          const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo);
+          if (ghData) {
+            const lyr = makeBoundaryLayer(ghData, ADMIN_STYLE_DESA, 'Desa/Kel (GitHub)');
+            if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
+          } else { errorCount++; }
+        }
+
+      } else {
+        // Kolom Kecamatan tidak terisi → tidak bisa tentukan scope desa, skip
+        console.info('UrbanTara: kolom Kecamatan kosong, layer Desa dilewati (scope tidak diketahui).');
+      }
     }
 
     // ── Tambahkan chip legenda di bawah peta (hanya jika ada layer yang berhasil) ──
     if (loadedCount > 0) {
       const legendEl = document.getElementById('mapLegend');
       if (legendEl) {
-        // Chip untuk Kab/Kota & Kecamatan (hanya mode non-desa)
-        if (showKabKec && (uniqueKab.length > 0 || uniqueKec.length > 0)) {
+        // Chip untuk Kab/Kota & Kecamatan (gaya sama: fill #00FFC5/20%, garis #A80000)
+        if (uniqueKab.length > 0 || uniqueKec.length > 0) {
           const chipAdmin = document.createElement('span');
           chipAdmin.className = 'map-legend-chip';
           chipAdmin.style.cursor = 'default';
@@ -4482,8 +4332,8 @@ button.project-btn:disabled{
             ' Batas Admin (Kab/Kec)';
           legendEl.appendChild(chipAdmin);
         }
-        // Chip untuk Desa (hanya mode desa)
-        if (showDesa && uniqueDesa.length > 0) {
+        // Chip untuk Desa (gaya: transparan, garis abu)
+        if ((adminLevel === 'desa' && uniqueDesa.length > 0) || adminLevel === 'kecamatan') {
           const chipDesa = document.createElement('span');
           chipDesa.className = 'map-legend-chip';
           chipDesa.style.cursor = 'default';
@@ -4505,6 +4355,121 @@ button.project-btn:disabled{
     } else {
       hideAdminMsg();
     }
+  }
+
+  // ── Fallback desa: ZIP TopoJSON dari GitHub ─────────────────────────────
+  // Dipakai jika BIG desa layer (layer 4) gagal di-query (CORS / field names).
+  // ZIP berisi TopoJSON batas kelurahan/desa.
+  // Return: GeoJSON FeatureCollection (terfilter kecamatan) atau null.
+  async function loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo) {
+    let fullGeo = _desaGitHubCache;
+
+    if (!fullGeo) {
+      // 1. Fetch ZIP
+      showAdminMsg('Memuat batas Desa dari GitHub (ZIP TopoJSON)…', 'loading');
+      let buffer;
+      try {
+        const resp = await fetch(GITHUB_DESA_ZIP_URL);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        buffer = await resp.arrayBuffer();
+      } catch (err) {
+        console.warn('GitHub desa ZIP fetch gagal:', err.message);
+        return null;
+      }
+
+      // 2. Unzip (JSZip sudah dimuat di head)
+      let zip;
+      try { zip = await JSZip.loadAsync(buffer); }
+      catch (err) { console.warn('JSZip error:', err.message); return null; }
+
+      // 3. Cari file .json atau .topojson di dalam ZIP (termasuk nested folder)
+      const jsonEntry = Object.values(zip.files).find(f =>
+        !f.dir && /\.(json|topojson)$/i.test(f.name)
+      );
+      if (!jsonEntry) { console.warn('Tidak ada file .json/.topojson di dalam ZIP'); return null; }
+
+      // 4. Parse
+      let data;
+      try {
+        const str = await jsonEntry.async('string');
+        data = JSON.parse(str);
+      } catch (err) { console.warn('JSON parse error:', err.message); return null; }
+
+      // 5. Konversi TopoJSON → GeoJSON (topojson-client dimuat dari cdnjs)
+      if (data.type === 'Topology') {
+        if (typeof topojson === 'undefined') {
+          console.warn('Library topojson belum tersedia');
+          return null;
+        }
+        const objKey = Object.keys(data.objects)[0];
+        if (!objKey) return null;
+        try { fullGeo = topojson.feature(data, data.objects[objKey]); }
+        catch (err) { console.warn('topojson.feature error:', err.message); return null; }
+      } else if (data.type === 'FeatureCollection') {
+        fullGeo = data; // sudah GeoJSON
+      } else {
+        console.warn('Format tidak dikenali:', data.type);
+        return null;
+      }
+
+      if (!fullGeo || !fullGeo.features || !fullGeo.features.length) return null;
+      _desaGitHubCache = fullGeo; // cache agar tidak re-download sesi ini
+    }
+
+    // 6. Filter ke kecamatan yang dianalisis
+    // Field kecamatan yang dicoba (BIG, BPS, GADM, format custom)
+    const KEC_FIELDS = ['WADMKC','wadmkc','KECAMATAN','kecamatan','KEC','kec','NAMKEC','namkec','NM_KEC','nm_kec','NAME_3','name_3'];
+    const KAB_FIELDS = ['WADMKK','wadmkk','KABKOT','kabkot','KABUPATEN','kabupaten','KAB','kab','NM_KAB','nm_kab','NAME_2','name_2'];
+    const kecLower = uniqueKec.map(k => k.toLowerCase().trim());
+    const kabLower = uniqueKab.map(k => k.toLowerCase().trim());
+
+    // Helper: cek apakah bbox dua objek overlap (cepat, tanpa full polygon-in-polygon)
+    function overlapsBbox(feature, bbox) {
+      const coords = extractAllCoords(feature.geometry);
+      if (!coords.length) return false;
+      let xn=Infinity, yn=Infinity, xx=-Infinity, yx=-Infinity;
+      coords.forEach(([x,y]) => { if(x<xn)xn=x; if(y<yn)yn=y; if(x>xx)xx=x; if(y>yx)yx=y; });
+      return !(xx < bbox.xmin || xn > bbox.xmax || yx < bbox.ymin || yn > bbox.ymax);
+    }
+
+    // A. Filter by nama kecamatan (field-based, paling presisi)
+    if (kecLower.length > 0) {
+      const filtered = fullGeo.features.filter(f => {
+        const p = f.properties || {};
+        // Opsional: batasi kabkota dulu (hindari nama kecamatan duplikat lintas kabkota)
+        if (kabLower.length > 0) {
+          for (const kf of KAB_FIELDS) {
+            if (p[kf]) {
+              const v = String(p[kf]).toLowerCase().trim();
+              if (!kabLower.some(k => v.includes(k) || k.includes(v))) return false;
+              break;
+            }
+          }
+        }
+        // Cocokkan nama kecamatan
+        for (const kf of KEC_FIELDS) {
+          if (p[kf]) {
+            const v = String(p[kf]).toLowerCase().trim();
+            if (kecLower.some(k => v === k || v.includes(k) || k.includes(v))) return true;
+          }
+        }
+        return false;
+      });
+      if (filtered.length > 0) return { type: 'FeatureCollection', features: filtered };
+    }
+
+    // B. Spatial fallback: filter by bbox kecamatanGeo (jika filter nama gagal)
+    if (kecamatanGeo) {
+      const bbox = featuresBbox(kecamatanGeo);
+      if (bbox) {
+        const filtered = fullGeo.features.filter(f => f.geometry && overlapsBbox(f, bbox));
+        if (filtered.length > 0) return { type: 'FeatureCollection', features: filtered };
+      }
+    }
+
+    // Jangan return fullGeo tanpa filter (terlalu banyak fitur)
+    console.warn('loadDesaFromGitHub: tidak ada fitur yang cocok setelah filter');
+    return null;
   }
 
   function renderMap(points, totalTiers){
