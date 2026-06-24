@@ -4160,10 +4160,11 @@ button.project-btn:disabled{
     return rings;
   }
 
-  // ── Spatial query Desa mengikuti GEOMETRI ASLI poligon Kecamatan yang sudah
-  // dimuat & ditampilkan di peta (bukan bbox-nya) — supaya desa yang muncul
-  // benar-benar mengikuti bentuk batas kecamatan persis seperti yang terlihat
-  // di peta, bukan sekadar berada dalam kotak pembatas (bbox) kecamatan.
+  // ── Spatial query Desa mengikuti GEOMETRI ASLI poligon Kecamatan ─────────
+  // CATATAN: Fungsi ini sudah tidak digunakan sebagai strategi utama karena
+  // sering gagal akibat payload geometry yang terlalu besar (ribuan vertex)
+  // atau timeout server. Strategi utama sekarang adalah namobj IN (attribute query).
+  // Fungsi ini dipertahankan sebagai referensi dan cadangan jika diperlukan kembali.
   // kecGeoFiltered: FeatureCollection kecamatan (sudah difilter ke yang dianalisis).
   async function spatialQueryDesaByKecamatanGeometry(kecGeoFiltered) {
     if (!kecGeoFiltered) return null;
@@ -4364,87 +4365,76 @@ button.project-btn:disabled{
       showAdminMsg('Memuat batas Desa (teranalisis saja)…', 'loading');
       let desaData = null;
 
-      // ── BARU — diutamakan duluan: spatial query mengikuti GEOMETRI ASLI
-      // poligon Kecamatan yang sudah dimuat & tampil di peta (kecamatanGeo),
-      // bukan sekadar bbox. Hasilnya lalu disaring lagi ke nama desa yang
-      // benar-benar dianalisis (kalau ada yang cocok namanya). ──
-      if (kecamatanGeo) {
+      // ── STRATEGI UTAMA: query langsung via namobj IN (nama desa dari kolom identitas)
+      // Layer 4 (Desa) BIG hanya punya field "namobj" untuk nama wilayah — tidak ada
+      // WADMKD/WADMKC/WADMKK seperti layer Kecamatan. Karena kolom identitas data
+      // analisis sudah berisi nama desa, kita query namobj IN (uniqueDesa) langsung
+      // tanpa perlu spatial query yang berat. ──
+
+      // A. Exact IN — semua nama desa sekaligus (satu request POST, paling cepat)
+      desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+        where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
+        outFields: DESA_OUT_FIELDS
+      });
+
+      // B. LIKE fallback — toleran kapitalisasi & prefiks "Desa "/"Kelurahan "/dll
+      if (!desaData) {
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+          where: sqlLikeField('namobj', uniqueDesa),
+          outFields: DESA_OUT_FIELDS
+        });
+      }
+
+      // C. Spatial fallback via bbox kecamatan — cadangan jika nama di data tidak
+      //    cocok persis dengan namobj di server (beda ejaan, ada prefiks, dst.)
+      if (!desaData && kecamatanGeo) {
         const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
         if (scopeGeo) {
-          showAdminMsg('Memuat batas Desa (spatial mengikuti poligon Kecamatan)…', 'loading');
-          desaData = await spatialQueryDesaByKecamatanGeometry(scopeGeo);
+          showAdminMsg('Memuat batas Desa (spatial bbox per kecamatan)…', 'loading');
+          desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
+          // Saring client-side ke nama desa yang dianalisis
           if (desaData && uniqueDesa.length > 0) {
             const filteredByName = desaData.features.filter(function(f) {
               return uniqueDesa.some(function(d) { return fuzzyMatch(getBIGName(f), d); });
             });
-            // Jika ada yang cocok namanya → pakai itu; kalau tidak ada yang cocok,
-            // tetap pakai seluruh desa hasil spatial (lebih aman daripada kosong).
             if (filteredByName.length > 0) desaData = { type: 'FeatureCollection', features: filteredByName };
           }
         }
       }
 
-      // ── Strategi lama (nama desa/kecamatan langsung ke server) — tetap
-      // dipertahankan sebagai fallback jika spatial di atas tidak berhasil.
-      // Catatan: layer Desa tidak punya field WADMKD/WADMKC, jadi klausa ini
-      // kemungkinan tetap akan gagal di server — itu sebabnya strategi spatial
-      // di atas yang diutamakan. outFields tetap diperbaiki ke DESA_OUT_FIELDS
-      // supaya request tidak ditolak gara-gara field yang tidak ada. ──
-      if (!desaData && uniqueKec.length > 0) {
-        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-          where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')',
-          outFields: DESA_OUT_FIELDS
-        });
-      }
-      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')', outFields: DESA_OUT_FIELDS });
-      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'namobj IN (' + sqlIn(uniqueDesa) + ')', outFields: DESA_OUT_FIELDS });
-      // Spatial fallback (bbox) — cadangan terakhir jika semua di atas gagal
-      if (!desaData) {
-        const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
-        if (scopeGeo) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
-      }
       if (desaData) {
         const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
         if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
       } else { errorCount++; }
 
     } else if (adminLevel === 'kecamatan') {
-      // Level kecamatan: tampilkan desa HANYA dalam kecamatan yang dianalisis
-      // Tidak boleh pakai bbox kabkota (terlalu luas, bisa kena limit fitur server BIG)
+      // Level kecamatan: tampilkan desa dalam kecamatan yang dianalisis
+      // Layer Desa tidak punya WADMKC/WADMKK — satu-satunya pendekatan via namobj
+      // (nama identitas pada data) atau spatial bbox (jika nama tidak cocok).
       if (uniqueKec.length > 0) {
         showAdminMsg('Memuat batas Desa dalam kecamatan teranalisis…', 'loading');
         let desaData = null;
 
-        // ── BARU — diutamakan duluan: spatial query mengikuti GEOMETRI ASLI
-        // poligon Kecamatan yang sudah dimuat & tampil di peta (kecamatanGeo),
-        // bukan sekadar bbox/nama — supaya desa yang muncul benar-benar
-        // mengikuti bentuk batas kecamatan yang terlihat di peta. ──
-        if (kecamatanGeo) {
-          const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
-          if (scopeGeo) {
-            showAdminMsg('Memuat batas Desa (spatial mengikuti poligon Kecamatan)…', 'loading');
-            desaData = await spatialQueryDesaByKecamatanGeometry(scopeGeo);
-          }
-        }
-
-        // ── Strategi lama — tetap dipertahankan sebagai fallback. Catatan:
-        // layer Desa tidak punya field WADMKC/WADMKK, jadi klausa ini
-        // kemungkinan tetap gagal di server BIG; outFields diperbaiki ke
-        // DESA_OUT_FIELDS supaya minimal tidak ditolak gara-gara field
-        // yang tidak ada. ──
-        // A. Query WADMKC (field nama kecamatan di layer desa) — paling presisi, 1 request
-        if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')', outFields: DESA_OUT_FIELDS });
-
-        // B. Tambah konteks kabkota (WADMKK) untuk menghindari nama kecamatan duplikat
-        if (!desaData && uniqueKab.length > 0) {
-          const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
+        // A. namobj IN (identitas wilayah) — di level kecamatan, identitas bisa berupa
+        //    nama kecamatan; jika desa-nya berbeda dari identitas, fallback spatial
+        //    di bawah yang akan mengambil semua desa dalam kecamatan tersebut.
+        if (uniqueDesa.length > 0) {
           desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')',
+            where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
             outFields: DESA_OUT_FIELDS
           });
         }
 
-        // C. Spatial fallback (bbox) — cadangan terakhir, hanya kecamatan yang dianalisis
+        // B. LIKE fallback
+        if (!desaData && uniqueDesa.length > 0) {
+          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+            where: sqlLikeField('namobj', uniqueDesa),
+            outFields: DESA_OUT_FIELDS
+          });
+        }
+
+        // C. Spatial fallback (bbox kecamatan) — dipakai ketika identitas data adalah
+        //    nama kecamatan sehingga namobj query ke layer desa tidak menemukan hasil.
         if (!desaData && kecamatanGeo) {
           const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
           if (scopeGeo) {
