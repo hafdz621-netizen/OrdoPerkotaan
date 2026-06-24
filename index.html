@@ -4139,7 +4139,7 @@ button.project-btn:disabled{
       const bbox = featuresBbox(bboxGeo);
       if (!bbox) return null;
       return queryBIGLayer(layerIdx, {
-        where: '1=1',
+        where: 'OBJECTID > 0',
         geometry: JSON.stringify({ xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax, spatialReference: { wkid: 4326 } }),
         geometryType: 'esriGeometryEnvelope',
         spatialRel: 'esriSpatialRelIntersects'
@@ -4198,11 +4198,24 @@ button.project-btn:disabled{
     }
 
     // ── 3. Desa ────────────────────────────────────────────────────────────
+    // Helper: ambil sub-GeoJSON yang hanya berisi kecamatan yang dianalisis
+    // (berguna kalau kecamatanGeo diambil via spatial fallback kabkota → berisi semua kecamatan)
+    function filterKecByAnalyzed(geo) {
+      if (!geo || !uniqueKec.length) return geo;
+      const filtered = geo.features.filter(f => {
+        const name = getBIGName(f).toLowerCase().trim();
+        return uniqueKec.some(k => {
+          const kl = k.toLowerCase().trim();
+          return name === kl || name.includes(kl) || kl.includes(name);
+        });
+      });
+      return filtered.length ? { type: 'FeatureCollection', features: filtered } : null;
+    }
+
     if (adminLevel === 'desa' && uniqueDesa.length > 0) {
       // Level desa: tampilkan HANYA desa yang teranalisis
       showAdminMsg('Memuat batas Desa (teranalisis saja)…', 'loading');
       let desaData = null;
-      // Coba dengan konteks kecamatan + kabkota
       if (uniqueKec.length > 0) {
         desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
           where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')'
@@ -4210,26 +4223,51 @@ button.project-btn:disabled{
       }
       if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')' });
       if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'NAMOBJ IN (' + sqlIn(uniqueDesa) + ')' });
-      // Spatial fallback: semua desa dalam bbox kecamatan/kabkota (menampilkan lebih dari yang dianalisis, tapi lebih baik dari kosong)
-      if (!desaData) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, kecamatanGeo || kabkotaGeo);
-
+      // Spatial fallback: gunakan bbox kecamatan yang dianalisis (bukan seluruh kabkota)
+      if (!desaData) {
+        const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
+        if (scopeGeo) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
+      }
       if (desaData) {
         const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
         if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
       } else { errorCount++; }
 
     } else if (adminLevel === 'kecamatan') {
-      // Level kecamatan: tampilkan desa dalam kecamatan teranalisis (spatial query via bbox)
-      // Fallback: gunakan bbox kabkota jika kecamatan gagal dimuat
-      const srcGeo = kecamatanGeo || kabkotaGeo;
-      if (srcGeo) {
-        const srcLabel = kecamatanGeo ? 'kecamatan' : 'Kab/Kota (fallback)';
-        showAdminMsg('Memuat batas Desa (' + srcLabel + ')…', 'loading');
-        const desaData = await spatialQuery(BIG_LAYER_INDEX.desa, srcGeo);
+      // Level kecamatan: tampilkan desa HANYA dalam kecamatan yang dianalisis
+      // Tidak boleh pakai bbox kabkota (terlalu luas, bisa kena limit fitur server BIG)
+      if (uniqueKec.length > 0) {
+        showAdminMsg('Memuat batas Desa dalam kecamatan teranalisis…', 'loading');
+        let desaData = null;
+
+        // A. Query WADMKC (field nama kecamatan di layer desa) — paling presisi, 1 request
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
+
+        // B. Tambah konteks kabkota (WADMKK) untuk menghindari nama kecamatan duplikat
+        if (!desaData && uniqueKab.length > 0) {
+          const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
+          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
+          });
+        }
+
+        // C. Spatial fallback — hanya kecamatan yang dianalisis (bukan bbox penuh kabkota)
+        if (!desaData && kecamatanGeo) {
+          const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
+          if (scopeGeo) {
+            showAdminMsg('Memuat batas Desa (spatial per kecamatan teranalisis)…', 'loading');
+            desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
+          }
+        }
+
         if (desaData) {
           const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
           if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
         } else { errorCount++; }
+
+      } else {
+        // Kolom Kecamatan tidak terisi → tidak bisa tentukan scope desa, skip
+        console.info('UrbanTara: kolom Kecamatan kosong, layer Desa dilewati (scope tidak diketahui).');
       }
     }
 
