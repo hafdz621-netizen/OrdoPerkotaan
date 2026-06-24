@@ -4061,6 +4061,28 @@ button.project-btn:disabled{
     return '(nama tidak tersedia)';
   }
 
+  // ── Helper: normalisasi nama wilayah (untuk fuzzy matching client-side) ─
+  // Strip prefix admin, lowercase, collapse whitespace
+  function normalizeName(s) {
+    return String(s || '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, ' ')
+      .replace(/^(kecamatan|kabupaten|kab\.|kota|kelurahan|kel\.|desa)\s+/i, '');
+  }
+
+  // ── Helper: fuzzy match dua nama wilayah (toleran kapitalisasi & spasi) ─
+  function fuzzyMatch(nameA, nameB) {
+    const a = normalizeName(nameA), b = normalizeName(nameB);
+    return a === b || a.includes(b) || b.includes(a);
+  }
+
+  // ── Helper: SQL LIKE clause untuk field tertentu (server-side fuzzy) ────
+  function sqlLikeField(field, vals) {
+    if (!vals || !vals.length) return '1=0';
+    return vals.map(v => field + " LIKE '%" + String(v).replace(/'/g, "''") + "%'").join(' OR ');
+  }
+
   // ── Helper: flatten koordinat dari GeoJSON geometry ─────────────────────
   function extractAllCoords(geometry) {
     if (!geometry || !geometry.coordinates) return [];
@@ -4150,34 +4172,62 @@ button.project-btn:disabled{
     }
 
     // ── 2. Kecamatan ───────────────────────────────────────────────────────
-    // Strategi: nama → WADMKC+WADMKK → NAMOBJ → WADMKC saja →
-    //           jika semua gagal, spatial query dalam bbox kabkota (fallback paling aman)
-    showAdminMsg('Memuat batas Kecamatan…', 'loading');
+    // Strategi (admin tertinggi → terendah):
+    //   A.  Query WADMKK (kabupaten) exact → dapat semua kec se-kabupaten
+    //   A2. Query WADMKK LIKE (handle "Kendal" vs "Kabupaten Kendal")
+    //       → filter client-side fuzzy ke uniqueKec (toleran spasi & kapital)
+    //   B.  Jika kabupaten kosong → LIKE query WADMKC / NAMOBJ per nama kecamatan
+    //   C.  Spatial fallback via bbox kabkota → filter client-side fuzzy
+    showAdminMsg('Memuat batas Kecamatan...', 'loading');
     {
       let kecData = null;
 
-      // ── A. Query berbasis nama (hanya jika uniqueKec terisi) ──────────────
-      if (uniqueKec.length > 0) {
-        if (uniqueKab.length > 0) {
+      // ── A. Query dari level tertinggi: kabupaten → saring kecamatan client-side ──
+      if (uniqueKab.length > 0) {
+        // A1. WADMKK exact IN (paling cepat, ambil semua kec se-kabupaten)
+        kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
+          where: 'WADMKK IN (' + sqlIn(uniqueKab) + ')'
+        });
+        // A2. WADMKK LIKE (handle variasi spasi/kapital/prefiks di nama kabupaten)
+        if (!kecData) {
           kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND WADMKK IN (' + sqlIn(uniqueKab) + ')'
+            where: sqlLikeField('WADMKK', uniqueKab)
           });
-          if (!kecData) {
-            const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
-            kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
-              where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
-            });
-          }
         }
-        if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'NAMOBJ IN (' + sqlIn(uniqueKec) + ')' });
-        if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
+        // Filter client-side ke kecamatan yang dianalisis (fuzzy: toleran spasi & kapital)
+        if (kecData && uniqueKec.length > 0) {
+          const filtered = kecData.features.filter(function(f) {
+            return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
+          });
+          // Jika ada match → pakai hasil filter; jika nol match → pakai semua kec se-kabupaten
+          if (filtered.length > 0) kecData = { type: 'FeatureCollection', features: filtered };
+        }
       }
 
-      // ── B. Spatial fallback: kecamatan dalam bbox kabkota ─────────────────
-      // Dipakai jika: kolom Kecamatan kosong di data, atau nama tidak cocok dengan BIG
+      // ── B. Kabupaten kosong → query langsung per nama kecamatan (LIKE fuzzy server-side) ──
+      if (!kecData && uniqueKec.length > 0) {
+        kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
+          where: sqlLikeField('WADMKC', uniqueKec)
+        });
+        if (!kecData) {
+          kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
+            where: sqlLikeField('NAMOBJ', uniqueKec)
+          });
+        }
+      }
+
+      // ── C. Spatial fallback: kecamatan dalam bbox kabkota ─────────────────
+      // Dipakai jika semua query nama gagal (CORS, field tidak ada, dll.)
       if (!kecData && kabkotaGeo) {
-        showAdminMsg('Memuat batas Kecamatan (spatial via Kab/Kota)…', 'loading');
+        showAdminMsg('Memuat batas Kecamatan (spatial via Kab/Kota)...', 'loading');
         kecData = await spatialQuery(BIG_LAYER_INDEX.kecamatan, kabkotaGeo);
+        // Tetap filter client-side fuzzy setelah spatial fallback
+        if (kecData && uniqueKec.length > 0) {
+          const filtered = kecData.features.filter(function(f) {
+            return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
+          });
+          if (filtered.length > 0) kecData = { type: 'FeatureCollection', features: filtered };
+        }
       }
 
       if (kecData) {
@@ -4193,12 +4243,8 @@ button.project-btn:disabled{
     function filterKecByAnalyzed(geo) {
       if (!geo) return null;
       if (!uniqueKec.length) return geo;
-      const filtered = geo.features.filter(f => {
-        const name = getBIGName(f).toLowerCase().trim();
-        return uniqueKec.some(k => {
-          const kl = k.toLowerCase().trim();
-          return name === kl || name.includes(kl) || kl.includes(name);
-        });
+      const filtered = geo.features.filter(function(f) {
+        return uniqueKec.some(function(k) { return fuzzyMatch(getBIGName(f), k); });
       });
       // Jika tidak ada yang cocok, pakai semua kecamatan yang ada (lebih aman daripada null)
       return { type: 'FeatureCollection', features: filtered.length ? filtered : geo.features };
