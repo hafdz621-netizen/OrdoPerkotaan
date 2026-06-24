@@ -4009,6 +4009,14 @@ button.project-btn:disabled{
   const ADMIN_STYLE_KEC  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 1.5 };
   const ADMIN_STYLE_DESA = { fillColor: 'transparent', fillOpacity: 0, color: '#aaaaaa', weight: 0.8 };
 
+  // ── PENTING: skema field layer Desa (index 4) BERBEDA dari layer Kab/Kota
+  // & Kecamatan di server BIG ini. Layer Desa TIDAK punya WADMKD/WADMKC/WADMKK
+  // — field yang ada cuma: namobj, kdpumdes, kdpumkec, kdpumkab, kdpumprov,
+  // tipadm, objectid (sudah dicek langsung ke schema layer-nya di server BIG).
+  // Kalau outFields tetap minta WADMKD/WADMKC/WADMKK (field yang tidak ada),
+  // server BIG menolak request → ITULAH sebab layer Desa selalu gagal dimuat.
+  const DESA_OUT_FIELDS = 'namobj,kdpumdes,kdpumkec,kdpumkab,kdpumprov,tipadm,objectid';
+
   // ── Helper: query BIG via POST (menghindari batas panjang URL GET) ──────
   async function queryBIGLayer(layerIdx, params) {
     const url = BIG_MAPSERVER_URL + '/' + layerIdx + '/query';
@@ -4039,6 +4047,7 @@ button.project-btn:disabled{
       return null;
     }
   }
+
 
   // ── Helper: SQL IN clause ────────────────────────────────────────────────
   function sqlIn(vals) {
@@ -4164,7 +4173,8 @@ button.project-btn:disabled{
     const spatialParams = {
       geometry: JSON.stringify(geomObj),
       geometryType: 'esriGeometryPolygon',
-      spatialRel: 'esriSpatialRelIntersects'
+      spatialRel: 'esriSpatialRelIntersects',
+      outFields: DESA_OUT_FIELDS // PENTING: layer Desa tidak punya WADMKD/WADMKC/WADMKK
     };
 
     // Coba POST dengan beberapa variasi WHERE (server BIG kadang menolak klausa tertentu)
@@ -4175,8 +4185,7 @@ button.project-btn:disabled{
 
     // Fallback: GET tanpa WHERE (bypass kemungkinan isu CORS pada POST tertentu)
     const qsParams = new URLSearchParams(Object.assign({
-      f: 'geojson', outSR: '4326', returnGeometry: 'true',
-      outFields: 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk'
+      f: 'geojson', outSR: '4326', returnGeometry: 'true'
     }, spatialParams));
     const getUrl = BIG_MAPSERVER_URL + '/' + BIG_LAYER_INDEX.desa + '/query?' + qsParams.toString();
     const controller = new AbortController();
@@ -4313,12 +4322,15 @@ button.project-btn:disabled{
     }
 
     // ── Helper: spatial query dengan beberapa strategi WHERE + fallback GET ──
-    async function spatialQuery(layerIdx, bboxGeo) {
+    // outFieldsOverride: opsional — dipakai untuk layer yang skema field-nya
+    // berbeda (misal layer Desa, lihat DESA_OUT_FIELDS di atas).
+    async function spatialQuery(layerIdx, bboxGeo, outFieldsOverride) {
       const bbox = featuresBbox(bboxGeo);
       if (!bbox) return null;
+      const outFieldsToUse = outFieldsOverride || 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk';
       const geomObj = { xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax, spatialReference: { wkid: 4326 } };
       const geomStr = JSON.stringify(geomObj);
-      const spatialParams = { geometry: geomStr, geometryType: 'esriGeometryEnvelope', spatialRel: 'esriSpatialRelIntersects' };
+      const spatialParams = { geometry: geomStr, geometryType: 'esriGeometryEnvelope', spatialRel: 'esriSpatialRelIntersects', outFields: outFieldsToUse };
 
       // Coba POST dengan beberapa variasi WHERE (server BIG kadang menolak klausa tertentu)
       for (const w of ['OBJECTID > 0', 'FID >= 0', 'objectid > 0', 'fid >= 0']) {
@@ -4328,8 +4340,7 @@ button.project-btn:disabled{
 
       // Fallback: GET tanpa WHERE (spatial filter saja) — bypass kemungkinan CORS POST issue
       const qsParams = new URLSearchParams(Object.assign({
-        f: 'geojson', outSR: '4326', returnGeometry: 'true',
-        outFields: 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk'
+        f: 'geojson', outSR: '4326', returnGeometry: 'true'
       }, spatialParams));
       const getUrl = BIG_MAPSERVER_URL + '/' + layerIdx + '/query?' + qsParams.toString();
       const controller = new AbortController();
@@ -4374,18 +4385,23 @@ button.project-btn:disabled{
       }
 
       // ── Strategi lama (nama desa/kecamatan langsung ke server) — tetap
-      // dipertahankan sebagai fallback jika spatial di atas tidak berhasil ──
+      // dipertahankan sebagai fallback jika spatial di atas tidak berhasil.
+      // Catatan: layer Desa tidak punya field WADMKD/WADMKC, jadi klausa ini
+      // kemungkinan tetap akan gagal di server — itu sebabnya strategi spatial
+      // di atas yang diutamakan. outFields tetap diperbaiki ke DESA_OUT_FIELDS
+      // supaya request tidak ditolak gara-gara field yang tidak ada. ──
       if (!desaData && uniqueKec.length > 0) {
         desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-          where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')'
+          where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')',
+          outFields: DESA_OUT_FIELDS
         });
       }
-      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')' });
-      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'NAMOBJ IN (' + sqlIn(uniqueDesa) + ')' });
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')', outFields: DESA_OUT_FIELDS });
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'namobj IN (' + sqlIn(uniqueDesa) + ')', outFields: DESA_OUT_FIELDS });
       // Spatial fallback (bbox) — cadangan terakhir jika semua di atas gagal
       if (!desaData) {
         const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
-        if (scopeGeo) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
+        if (scopeGeo) desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
       }
       if (desaData) {
         const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
@@ -4411,15 +4427,20 @@ button.project-btn:disabled{
           }
         }
 
-        // ── Strategi lama — tetap dipertahankan sebagai fallback ──
+        // ── Strategi lama — tetap dipertahankan sebagai fallback. Catatan:
+        // layer Desa tidak punya field WADMKC/WADMKK, jadi klausa ini
+        // kemungkinan tetap gagal di server BIG; outFields diperbaiki ke
+        // DESA_OUT_FIELDS supaya minimal tidak ditolak gara-gara field
+        // yang tidak ada. ──
         // A. Query WADMKC (field nama kecamatan di layer desa) — paling presisi, 1 request
-        if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
+        if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')', outFields: DESA_OUT_FIELDS });
 
         // B. Tambah konteks kabkota (WADMKK) untuk menghindari nama kecamatan duplikat
         if (!desaData && uniqueKab.length > 0) {
           const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
           desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
+            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')',
+            outFields: DESA_OUT_FIELDS
           });
         }
 
@@ -4428,7 +4449,7 @@ button.project-btn:disabled{
           const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
           if (scopeGeo) {
             showAdminMsg('Memuat batas Desa (spatial bbox per kecamatan teranalisis)…', 'loading');
-            desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo);
+            desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
           }
         }
 
