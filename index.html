@@ -1201,13 +1201,13 @@ button.project-btn:disabled{
 
           <hr class="feat-divider">
           <div class="feat-sub-title">🗺 Batas administrasi — layanan resmi BIG (Kebijakan Satu Peta)</div>
-          <p style="font-size:12.5px; line-height:1.6; color:var(--ink-soft); margin:0 0 8px;">Batas administrasi ditampilkan sebagai overlay langsung dari server resmi BIG — tidak perlu upload file apapun, dan tidak ada batas ukuran data karena rendering dilakukan di server. Aktifkan salah satu atau semua level dari panel kontrol layer di pojok kanan atas peta.</p>
+          <p style="font-size:12.5px; line-height:1.6; color:var(--ink-soft); margin:0 0 8px;">Batas administrasi dimuat otomatis dari server BIG saat peta ditampilkan — <strong>hanya wilayah yang teranalisis</strong>, bukan seluruh Indonesia. Layer diambil via operasi query GeoJSON dan dirender langsung oleh Leaflet (bukan tile gambar), sehingga bisa diklik untuk melihat nama wilayah. Layer muncul di panel kontrol layer (kanan atas) setelah proses pemuatan selesai.</p>
           <div class="feat-tab-list">
-            <div class="feat-tab-row"><span class="feat-tab-label">🔴 Batas Kab/Kota</span><span>Batas administratif setingkat kabupaten/kota, diambil langsung dari layanan BIG.</span></div>
-            <div class="feat-tab-row"><span class="feat-tab-label">🟠 Batas Kecamatan</span><span>Batas administratif setingkat kecamatan, diambil langsung dari layanan BIG.</span></div>
-            <div class="feat-tab-row"><span class="feat-tab-label">🟢 Batas Desa/Kel</span><span>Batas administratif setingkat desa/kelurahan, diambil langsung dari layanan BIG.</span></div>
+            <div class="feat-tab-row"><span class="feat-tab-label">🔴 Batas Kab/Kota</span><span>Difilter berdasarkan Kabupaten/Kota yang ada pada data — hanya kab/kota yang dianalisis yang dimuat. Fill hijau toska transparan, garis merah tua.</span></div>
+            <div class="feat-tab-row"><span class="feat-tab-label">🟠 Batas Kecamatan</span><span>Difilter berdasarkan nama Kecamatan pada data, dipersempit oleh Kab/Kota agar tidak salah (nama kecamatan yang sama di kab/kota berbeda). Gaya sama dengan Kab/Kota.</span></div>
+            <div class="feat-tab-row"><span class="feat-tab-label">🟢 Batas Desa/Kel</span><span>Jika level analisis adalah <em>Desa</em>: hanya desa yang teranalisis yang dimuat. Jika level <em>Kecamatan</em>: semua desa dalam kecamatan teranalisis dimuat via query spasial. Gaya transparan (hanya garis tipis abu-abu).</span></div>
           </div>
-          <div class="feat-note" style="margin-top:8px;">Klik pada garis batas administrasi yang sedang aktif untuk menampilkan nama wilayah pada titik tersebut (jika koneksi ke server BIG tersedia). Jika level lebih dari satu sedang aktif, sistem memprioritaskan level paling detail (Desa/Kel &gt; Kecamatan &gt; Kab/Kota). Warna garis ditentukan oleh styling default server BIG dan tidak dapat diubah dari aplikasi ini.</div>
+          <div class="feat-note" style="margin-top:8px;">Klik pada area batas administrasi untuk menampilkan nama wilayah sebagai popup (langsung dari data GeoJSON — tidak butuh request tambahan ke server). Jika kolom Kabupaten/Kota dan Kecamatan tidak diisi saat upload, filter tidak dapat diterapkan dan pesan peringatan akan ditampilkan. Pemuatan bergantung pada koneksi ke server BIG — jika server tidak tersedia, titik peta tetap ditampilkan.</div>
 
           <hr class="feat-divider">
           <div class="feat-sub-title">Unggah SHP Titik Desa (opsional, untuk level Desa)</div>
@@ -3986,15 +3986,7 @@ button.project-btn:disabled{
       showError(detail + ' Wilayah yang berhasil tetap ditampilkan di peta.');
     }
 
-    let boundaryData = null;
-    try {
-      boundaryData = await loadAdminBoundaryData(adminLevel, adminComponents);
-    } catch (errBoundary) {
-      console.warn('Boundary query gagal, peta titik tetap ditampilkan:', errBoundary);
-      showAdminMsg('Batas administrasi gagal dimuat, tetapi titik peta tetap ditampilkan.', 'warn');
-    }
-
-    renderMap(points, tierData.totalTiers, boundaryData);
+    renderMap(points, tierData.totalTiers);
   }
 
   // ── LULC (Land Use / Land Cover) CONFIG ───────────────────────────────
@@ -4004,227 +3996,268 @@ button.project-btn:disabled{
   // EPSG:3857, tidak butuh auth, tidak ada isu CORS (murni <img> tile).
   const LULC_TILE_URL = 'https://tiles.arcgis.com/tiles/82C0E4OYu0hT3hkh/arcgis/rest/services/Indonesia_Hybrid_Landcover_2020/MapServer/tile/{z}/{y}/{x}';
 
-
   // ── ADMIN BOUNDARY: ArcGIS REST MapServer BIG (Kebijakan Satu Peta) ───
-  // Data batas administrasi sekarang diambil lewat operasi "query" dan
-  // dirender sebagai GeoJSON sehingga hanya wilayah yang dianalisis yang
-  // dimuat ke peta.
+  // Layer batas administrasi diambil via operasi "query" ArcGIS REST sebagai
+  // GeoJSON yang sudah difilter sesuai wilayah yang dianalisis — bukan tile
+  // seluruh Indonesia seperti sebelumnya. Hasilnya dirender dengan L.geoJSON().
   const BIG_MAPSERVER_URL = 'https://kspservices.big.go.id/satupeta/rest/services/PUBLIK/BATAS_WILAYAH/MapServer';
   const BIG_LAYER_INDEX = { kabkota: 2, kecamatan: 3, desa: 4 };
+  const ADMIN_QUERY_TIMEOUT_MS = 20000; // lebih panjang dari identify karena response lebih besar
 
-  const ADMIN_BOUNDARY_STYLE_NON_DESA = {
-    color: '#A80000',
-    weight: 2,
-    opacity: 1,
-    fillColor: '#00FFC5',
-    fillOpacity: 0.2
-  };
-  const ADMIN_BOUNDARY_STYLE_DESA = {
-    color: '#ffffff',
-    weight: 2,
-    opacity: 1,
-    fillColor: '#00FFC5',
-    fillOpacity: 0.0
-  };
+  // Warna batas administrasi (kab/kota & kecamatan; desa transparan)
+  const ADMIN_STYLE_KAB  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 2.0 };
+  const ADMIN_STYLE_KEC  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 1.5 };
+  const ADMIN_STYLE_DESA = { fillColor: 'transparent', fillOpacity: 0, color: '#aaaaaa', weight: 0.8 };
 
-  function adminSqlLiteral(value) {
-    return "'" + String(value).replace(/'/g, "''") + "'";
-  }
-
-  function adminNormalizeJs(value) {
-    return String(value || '')
-      .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, '');
-  }
-
-  function adminNameVariants(value) {
-    const raw = String(value || '').replace(/\s+/g, ' ').trim();
-    if (!raw) return [];
-
-    const variants = new Set();
-    const addVariant = (v) => {
-      const n = adminNormalizeJs(v);
-      if (n) variants.add(n);
-    };
-
-    addVariant(raw);
-
-    const stripped = [
-      raw.replace(/^(KABUPATEN|KAB\.|KOTA|KOTA\.)\s+/i, ''),
-      raw.replace(/^(KECAMATAN|KEC\.|KEC)\s+/i, ''),
-      raw.replace(/^(DESA|KELURAHAN|KEL\.|KEL)\s+/i, ''),
-      raw.replace(/^(KELURAHAN|DESA)\s+/i, '')
-    ];
-
-    stripped.forEach(addVariant);
-    return Array.from(variants);
-  }
-
-  function buildSqlNormalizeExpr(field) {
-    return `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(${field})), ' ', ''), '.', ''), '-', ''), '/', ''), ',', '')`;
-  }
-
-  function buildFieldMatchClause(field, variants) {
-    const parts = (variants || [])
-      .filter(Boolean)
-      .map(v => `${buildSqlNormalizeExpr(field)} = ${adminSqlLiteral(v)}`);
-    if (!parts.length) return '';
-    if (parts.length === 1) return parts[0];
-    return '(' + parts.join(' OR ') + ')';
-  }
-
-  function uniqueNormalized(values) {
-    const out = [];
-    const seen = new Set();
-    for (const v of values) {
-      const n = adminNormalizeJs(v);
-      if (!n || seen.has(n)) continue;
-      seen.add(n);
-      out.push(n);
+  // ── Helper: query BIG via POST (menghindari batas panjang URL GET) ──────
+  async function queryBIGLayer(layerIdx, params) {
+    const url = BIG_MAPSERVER_URL + '/' + layerIdx + '/query';
+    const body = new URLSearchParams(Object.assign({
+      f: 'geojson',
+      outSR: '4326',
+      returnGeometry: 'true',
+      outFields: 'NAMOBJ,namobj,WADMKD,wadmkd,WADMKC,wadmkc,WADMKK,wadmkk'
+    }, params));
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), ADMIN_QUERY_TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+        signal: controller.signal
+      });
+      clearTimeout(tid);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const json = await resp.json();
+      if (json && json.error) throw new Error('BIG: ' + JSON.stringify(json.error));
+      if (!json || !json.features || !json.features.length) return null;
+      return json;
+    } catch (err) {
+      clearTimeout(tid);
+      console.warn('BIG query layer ' + layerIdx + ':', err.message);
+      return null;
     }
-    return out;
   }
 
-  function chunkArray(arr, size) {
-    const chunks = [];
-    for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
-    return chunks;
+  // ── Helper: SQL IN clause ────────────────────────────────────────────────
+  function sqlIn(vals) {
+    if (!vals || !vals.length) return "''";
+    return vals.map(v => "'" + String(v).replace(/'/g, "''") + "'").join(',');
   }
 
-  function buildBoundaryClauses(kind, adminLevel, adminComponents) {
-    const clauses = [];
-    const seen = new Set();
-
-    adminComponents.forEach(ac => {
-      const kabVariants = adminNameVariants(ac.kabupaten);
-      const kecVariants = adminNameVariants(ac.kecamatan);
-      const desaVariants = adminNameVariants(ac.desa);
-      let clause = '';
-
-      if (kind === 'kabkota') {
-        clause = buildFieldMatchClause('namobj', kabVariants);
-      } else if (kind === 'kecamatan') {
-        if (kabVariants.length && kecVariants.length) {
-          clause = '(' + buildFieldMatchClause('wadmkk', kabVariants) + ' AND ' + buildFieldMatchClause('wadmkc', kecVariants) + ')';
-        } else if (kecVariants.length) {
-          clause = buildFieldMatchClause('wadmkc', kecVariants);
-        }
-      } else if (kind === 'desa') {
-        if (adminLevel === 'desa' && kabVariants.length && kecVariants.length && desaVariants.length) {
-          clause = '(' + buildFieldMatchClause('wadmkk', kabVariants) + ' AND ' + buildFieldMatchClause('wadmkc', kecVariants) + ' AND ' + buildFieldMatchClause('wadmkd', desaVariants) + ')';
-        } else if (kabVariants.length && kecVariants.length) {
-          clause = '(' + buildFieldMatchClause('wadmkk', kabVariants) + ' AND ' + buildFieldMatchClause('wadmkc', kecVariants) + ')';
-        } else if (desaVariants.length) {
-          clause = buildFieldMatchClause('wadmkd', desaVariants);
-        }
-      }
-
-      if (clause && !seen.has(clause)) {
-        seen.add(clause);
-        clauses.push(clause);
-      }
-    });
-
-    return clauses;
+  // ── Helper: SQL LIKE clause (untuk kabkota — "Kendal" vs "Kabupaten Kendal") ──
+  function sqlLikeNameobj(vals) {
+    if (!vals || !vals.length) return '1=0';
+    return vals.map(v => "NAMOBJ LIKE '%" + String(v).replace(/'/g, "''") + "%'").join(' OR ');
   }
 
-  function extractFeatureKey(feature) {
-    if (!feature) return '';
-    if (feature.id !== undefined && feature.id !== null) return String(feature.id);
+  // ── Helper: ambil nama wilayah dari feature properties BIG ──────────────
+  function getBIGName(feature) {
     const p = feature.properties || {};
-    return String(
-      p.objectid ?? p.OBJECTID ?? p.oid ?? p.OID ?? p.namobj ?? p.NAMOBJ ??
-      p.wadmkk ?? p.WADMKK ?? p.wadmkc ?? p.WADMKC ?? p.wadmkd ?? p.WADMKD ?? ''
-    );
+    for (const k of ['NAMOBJ','namobj','WADMKD','wadmkd','WADMKC','wadmkc','WADMKK','wadmkk','name','nama']) {
+      if (p[k]) return String(p[k]);
+    }
+    return '(nama tidak tersedia)';
   }
 
-  async function fetchAdminGeoJSON(layerIndex, where) {
-    const url = BIG_MAPSERVER_URL + '/' + layerIndex + '/query'
-      + '?f=geojson'
-      + '&where=' + encodeURIComponent(where)
-      + '&returnGeometry=true'
-      + '&outFields=*'
-      + '&outSR=4326';
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' saat query BIG layer ' + layerIndex);
-    const data = await resp.json();
-    return {
-      type: 'FeatureCollection',
-      features: Array.isArray(data.features) ? data.features : []
-    };
+  // ── Helper: flatten koordinat dari GeoJSON geometry ─────────────────────
+  function extractAllCoords(geometry) {
+    if (!geometry || !geometry.coordinates) return [];
+    const result = [];
+    function walk(c) {
+      if (!Array.isArray(c)) return;
+      if (c.length >= 2 && typeof c[0] === 'number' && typeof c[1] === 'number') { result.push(c); return; }
+      c.forEach(walk);
+    }
+    walk(geometry.coordinates);
+    return result;
   }
 
-  async function fetchAdminGeoJSONChunks(layerIndex, clauses) {
-    if (!clauses.length) return { type: 'FeatureCollection', features: [] };
-
-    const seen = new Set();
-    const features = [];
-    const batches = chunkArray(clauses, 24);
-
-    for (const batch of batches) {
-      const where = batch.length === 1 ? batch[0] : '(' + batch.join(' OR ') + ')';
-      const fc = await fetchAdminGeoJSON(layerIndex, where);
-      for (const feature of fc.features) {
-        const key = extractFeatureKey(feature) || JSON.stringify(feature.geometry || {}) + JSON.stringify(feature.properties || {});
-        if (seen.has(key)) continue;
-        seen.add(key);
-        features.push(feature);
-      }
-    }
-
-    return { type: 'FeatureCollection', features };
+  // ── Helper: bounding box gabungan dari semua feature GeoJSON ────────────
+  function featuresBbox(geojson) {
+    if (!geojson || !geojson.features) return null;
+    let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+    geojson.features.forEach(f => {
+      extractAllCoords(f.geometry).forEach(([x, y]) => {
+        if (x < xmin) xmin = x; if (y < ymin) ymin = y;
+        if (x > xmax) xmax = x; if (y > ymax) ymax = y;
+      });
+    });
+    return isFinite(xmin) ? { xmin, ymin, xmax, ymax } : null;
   }
 
-  async function loadAdminBoundaryData(adminLevel, adminComponents) {
-    const payload = { kabkota: null, kecamatan: null, desa: null };
-
-    const kabClauses = buildBoundaryClauses('kabkota', adminLevel, adminComponents);
-    const kecClauses = buildBoundaryClauses('kecamatan', adminLevel, adminComponents);
-    const desaClauses = buildBoundaryClauses('desa', adminLevel, adminComponents);
-
-    if (kabClauses.length) {
-      payload.kabkota = await fetchAdminGeoJSONChunks(BIG_LAYER_INDEX.kabkota, kabClauses);
-    }
-    if (kecClauses.length) {
-      payload.kecamatan = await fetchAdminGeoJSONChunks(BIG_LAYER_INDEX.kecamatan, kecClauses);
-    }
-    if (desaClauses.length) {
-      payload.desa = await fetchAdminGeoJSONChunks(BIG_LAYER_INDEX.desa, desaClauses);
-    }
-
-    return payload;
-  }
-
-  function makeAdminBoundaryLayer(kind, featureCollection) {
-    const style = (kind === 'desa') ? ADMIN_BOUNDARY_STYLE_DESA : ADMIN_BOUNDARY_STYLE_NON_DESA;
-    const layer = L.geoJSON(featureCollection || { type: 'FeatureCollection', features: [] }, {
+  // ── Helper: buat L.geoJSON layer dengan style & popup per feature ────────
+  function makeBoundaryLayer(geojson, style, levelLabel) {
+    if (!geojson) return null;
+    return L.geoJSON(geojson, {
       style: () => style,
-      onEachFeature: function(feature, l) {
-        const p = feature && feature.properties ? feature.properties : {};
-        const name = String(p.namobj || p.NAMOBJ || p.wadmkd || p.WADMKD || p.wadmkc || p.WADMKC || p.wadmkk || p.WADMKK || '').trim();
-        if (name) {
-          l.bindTooltip(name, { className: 'admin-boundary-tip', sticky: true });
-          l.bindPopup(
-            '<b style="font-size:13px;">' + escapeHtml(name) + '</b>' +
-            '<br><span style="color:#666; font-size:11px;">Batas administrasi ' + (kind === 'desa' ? 'Desa/Kelurahan' : 'Kab/Kota & Kecamatan') + '</span>'
-          );
-        }
+      onEachFeature: function(feature, layer) {
+        const name = getBIGName(feature);
+        // Tooltip saat hover
+        layer.bindTooltip(escapeHtml(name), { className: 'admin-boundary-tip', sticky: true });
+        // Popup saat klik (stopPropagation agar klik titik tidak terinterferensi)
+        layer.on('click', function(e) {
+          L.DomEvent.stopPropagation(e);
+          L.popup({ maxWidth: 280 })
+            .setLatLng(e.latlng)
+            .setContent(
+              '<b style="font-size:13px;">' + escapeHtml(name) + '</b>' +
+              '<br><span style="color:#888;font-size:11px;">Level: ' + escapeHtml(levelLabel) + '</span>'
+            )
+            .openOn(leafletMap);
+        });
       }
     });
-    return layer;
   }
 
-  function updateAdminBoundaryLegend() {
-    const legend = document.getElementById('adminBoundaryLegend');
-    if (!legend) return;
-    legend.innerHTML =
-      '<span class="legend-item"><span class="swatch kabkec"></span>Batas Kab/Kota &amp; Kecamatan</span>' +
-      '<span class="legend-item"><span class="swatch desa"></span>Batas Desa/Kel (gaya BIG)</span>';
+  // ── Fungsi utama: muat batas administrasi terfilter dari BIG ────────────
+  // adminComponents: [{desa, kecamatan, kabupaten}] dari lastAnalysis
+  // adminLevel: 'desa' | 'kecamatan'
+  // layerCtrl: referensi L.control.layers() yang sudah dibuat
+  async function loadAdminBoundaries(adminComponents, adminLevel, layerCtrl) {
+    if (!adminComponents || !adminComponents.length) return;
+
+    const uniqueKab = [...new Set(adminComponents.map(a => a.kabupaten).filter(v => v && v.trim()))];
+    const uniqueKec = [...new Set(adminComponents.map(a => a.kecamatan).filter(v => v && v.trim()))];
+    const uniqueDesa = [...new Set(adminComponents.map(a => a.desa).filter(v => v && v.trim()))];
+
+    const hasAdminContext = uniqueKab.length > 0 || uniqueKec.length > 0;
+    if (!hasAdminContext && adminLevel !== 'desa') {
+      showAdminMsg('Kolom Kabupaten/Kota dan Kecamatan tidak terisi — batas administrasi tidak dapat dimuat otomatis.', 'warn');
+      return;
+    }
+
+    showAdminMsg('Memuat batas administrasi dari BIG (hanya wilayah teranalisis)…', 'loading');
+
+    let loadedCount = 0, errorCount = 0;
+    let kecamatanGeo = null; // disimpan untuk keperluan spatial query desa (level kecamatan)
+
+    // ── 1. Kab/Kota ────────────────────────────────────────────────────────
+    if (uniqueKab.length > 0) {
+      showAdminMsg('Memuat batas Kab/Kota (' + uniqueKab.join(', ') + ')…', 'loading');
+      // Coba exact IN dulu, lalu LIKE (menangani "Kendal" vs "Kabupaten Kendal")
+      let kabData = await queryBIGLayer(BIG_LAYER_INDEX.kabkota, { where: 'NAMOBJ IN (' + sqlIn(uniqueKab) + ')' });
+      if (!kabData) kabData = await queryBIGLayer(BIG_LAYER_INDEX.kabkota, { where: sqlLikeNameobj(uniqueKab) });
+      if (kabData) {
+        const lyr = makeBoundaryLayer(kabData, ADMIN_STYLE_KAB, 'Kab/Kota');
+        if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F534; Batas Kab/Kota'); loadedCount++; }
+      } else { errorCount++; }
+    }
+
+    // ── 2. Kecamatan ───────────────────────────────────────────────────────
+    if (uniqueKec.length > 0) {
+      showAdminMsg('Memuat batas Kecamatan (' + uniqueKec.join(', ') + ')…', 'loading');
+      // Strategi: coba dengan konteks kabkota (WADMKK), fallback tanpa
+      let kecData = null;
+      if (uniqueKab.length > 0) {
+        // Coba WADMKC + WADMKK
+        kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
+          where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND WADMKK IN (' + sqlIn(uniqueKab) + ')'
+        });
+        // Fallback: LIKE untuk kab (handles "Kabupaten Kendal" vs "Kendal")
+        if (!kecData) {
+          const kabLike = uniqueKab.map(k => "WADMKK LIKE '%" + k.replace(/'/g, "''") + "%'").join(' OR ');
+          kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, {
+            where: 'WADMKC IN (' + sqlIn(uniqueKec) + ') AND (' + kabLike + ')'
+          });
+        }
+      }
+      // Fallback final: hanya pakai NAMOBJ
+      if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'NAMOBJ IN (' + sqlIn(uniqueKec) + ')' });
+      if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
+
+      if (kecData) {
+        kecamatanGeo = kecData; // simpan untuk spatial query desa
+        const lyr = makeBoundaryLayer(kecData, ADMIN_STYLE_KEC, 'Kecamatan');
+        if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E0; Batas Kecamatan'); loadedCount++; }
+      } else { errorCount++; }
+    }
+
+    // ── 3. Desa ────────────────────────────────────────────────────────────
+    if (adminLevel === 'desa' && uniqueDesa.length > 0) {
+      // Level desa: tampilkan HANYA desa yang teranalisis
+      showAdminMsg('Memuat batas Desa (teranalisis saja)…', 'loading');
+      let desaData = null;
+      // Coba dengan konteks kecamatan + kabkota
+      if (uniqueKec.length > 0) {
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+          where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ') AND WADMKC IN (' + sqlIn(uniqueKec) + ')'
+        });
+      }
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'WADMKD IN (' + sqlIn(uniqueDesa) + ')' });
+      if (!desaData) desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, { where: 'NAMOBJ IN (' + sqlIn(uniqueDesa) + ')' });
+
+      if (desaData) {
+        const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
+        if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
+      } else { errorCount++; }
+
+    } else if (adminLevel === 'kecamatan') {
+      // Level kecamatan: tampilkan desa dalam kecamatan teranalisis (spatial query via bbox)
+      const srcGeo = kecamatanGeo;
+      if (srcGeo) {
+        showAdminMsg('Memuat batas Desa dalam kecamatan teranalisis (spasial)…', 'loading');
+        const bbox = featuresBbox(srcGeo);
+        if (bbox) {
+          const geomStr = JSON.stringify({
+            xmin: bbox.xmin, ymin: bbox.ymin, xmax: bbox.xmax, ymax: bbox.ymax,
+            spatialReference: { wkid: 4326 }
+          });
+          const desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+            where: '1=1',
+            geometry: geomStr,
+            geometryType: 'esriGeometryEnvelope',
+            spatialRel: 'esriSpatialRelIntersects'
+          });
+          if (desaData) {
+            const lyr = makeBoundaryLayer(desaData, ADMIN_STYLE_DESA, 'Desa/Kel');
+            if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
+          } else { errorCount++; }
+        }
+      }
+    }
+
+    // ── Tambahkan chip legenda di bawah peta (hanya jika ada layer yang berhasil) ──
+    if (loadedCount > 0) {
+      const legendEl = document.getElementById('mapLegend');
+      if (legendEl) {
+        // Chip untuk Kab/Kota & Kecamatan (gaya sama: fill #00FFC5/20%, garis #A80000)
+        if (uniqueKab.length > 0 || uniqueKec.length > 0) {
+          const chipAdmin = document.createElement('span');
+          chipAdmin.className = 'map-legend-chip';
+          chipAdmin.style.cursor = 'default';
+          chipAdmin.innerHTML =
+            '<span class="dot" style="background:rgba(0,255,197,0.2);border:2px solid #A80000;box-sizing:border-box;"></span>' +
+            ' Batas Admin (Kab/Kec)';
+          legendEl.appendChild(chipAdmin);
+        }
+        // Chip untuk Desa (gaya: transparan, garis abu)
+        if ((adminLevel === 'desa' && uniqueDesa.length > 0) || adminLevel === 'kecamatan') {
+          const chipDesa = document.createElement('span');
+          chipDesa.className = 'map-legend-chip';
+          chipDesa.style.cursor = 'default';
+          chipDesa.innerHTML =
+            '<span class="dot" style="background:transparent;border:2px solid #aaaaaa;box-sizing:border-box;"></span>' +
+            ' Batas Desa/Kel';
+          legendEl.appendChild(chipDesa);
+        }
+      }
+    }
+
+    // ── Status akhir ───────────────────────────────────────────────────────
+    if (loadedCount === 0 && errorCount > 0) {
+      showAdminMsg('Gagal memuat batas administrasi dari BIG (CORS/server tidak dapat diakses). Titik peta tetap tersedia.', 'err');
+    } else if (loadedCount > 0 && errorCount > 0) {
+      showAdminMsg(loadedCount + ' layer batas admin berhasil dimuat, ' + errorCount + ' layer gagal. Aktifkan dari ikon layer ▲ kanan atas.', 'warn');
+    } else if (loadedCount > 0) {
+      showAdminMsg('Batas administrasi berhasil dimuat (' + loadedCount + ' layer). Aktifkan dari ikon layer di kanan atas peta.', 'ok');
+    } else {
+      hideAdminMsg();
+    }
   }
 
-  function renderMap(points, totalTiers, boundaryData = null){
+  function renderMap(points, totalTiers){
     lastMapPoints = points;
     lastMapTotalTiers = totalTiers;
     document.getElementById('downloadShpBtn').style.display = 'inline-block';
@@ -4264,6 +4297,8 @@ button.project-btn:disabled{
     });
 
     // ── OVERLAY: LULC Indonesia 10m (Hybrid Landcover, CSIRO) ───────────
+    // Tile cache ArcGIS publik (lihat LULC_TILE_URL di atas) — standar
+    // L.tileLayer biasa, bukan WMS, karena ini map service yang ter-cache.
     const lulcLayer = L.tileLayer(LULC_TILE_URL, {
       attribution: '&copy; CSIRO — Indonesia Hybrid Landcover 2020 (10 m)',
       maxNativeZoom: 16,
@@ -4272,25 +4307,12 @@ button.project-btn:disabled{
       opacity: 0.82
     });
 
-    // ── ADMIN BOUNDARY LAYERS: GeoJSON hasil query BIG ───────────────────
-    const adminBoundaryLayers = {};
-    if (boundaryData && boundaryData.kabkota && Array.isArray(boundaryData.kabkota.features) && boundaryData.kabkota.features.length){
-      adminBoundaryLayers.kabkota = makeAdminBoundaryLayer('kabkota', boundaryData.kabkota);
-    }
-    if (boundaryData && boundaryData.kecamatan && Array.isArray(boundaryData.kecamatan.features) && boundaryData.kecamatan.features.length){
-      adminBoundaryLayers.kecamatan = makeAdminBoundaryLayer('kecamatan', boundaryData.kecamatan);
-    }
-    if (boundaryData && boundaryData.desa && Array.isArray(boundaryData.desa.features) && boundaryData.desa.features.length){
-      adminBoundaryLayers.desa = makeAdminBoundaryLayer('desa', boundaryData.desa);
-    }
-
     // Add default basemap
     osmLayer.addTo(leafletMap);
 
-    // Add available admin boundary layers by default so user immediately sees the analysis area.
-    Object.values(adminBoundaryLayers).forEach(layer => layer.addTo(leafletMap));
-
     // ── LAYER CONTROL ───────────────────────────────────────────────────
+    // Batas administrasi akan ditambahkan secara dinamis ke layerCtrl
+    // setelah GeoJSON-nya berhasil dimuat dari BIG (lihat loadAdminBoundaries).
     const baseMapsCtrl = {
       'OpenStreetMap':  osmLayer,
       'Esri Satellite': esriSatLayer,
@@ -4298,33 +4320,9 @@ button.project-btn:disabled{
       'CartoDB Light':  cartoLightLayer
     };
     const overlayCtrl = {
-      '🌿 LULC Indonesia 10m': lulcLayer
+      '&#x1F33F; LULC Indonesia 10m': lulcLayer
     };
-    if (adminBoundaryLayers.kabkota) overlayCtrl['🔴 Batas Kab/Kota'] = adminBoundaryLayers.kabkota;
-    if (adminBoundaryLayers.kecamatan) overlayCtrl['🟠 Batas Kecamatan'] = adminBoundaryLayers.kecamatan;
-    if (adminBoundaryLayers.desa) overlayCtrl['🟢 Batas Desa/Kel'] = adminBoundaryLayers.desa;
-    L.control.layers(baseMapsCtrl, overlayCtrl, { position: 'topright', collapsed: true }).addTo(leafletMap);
-
-    // Keep click interaction lightweight: show the first active boundary name if present.
-    leafletMap.on('click', function(e) {
-      const active = [];
-      if (leafletMap.hasLayer(adminBoundaryLayers.desa)) active.push({ key: 'desa', label: 'Desa/Kel' });
-      if (leafletMap.hasLayer(adminBoundaryLayers.kecamatan)) active.push({ key: 'kecamatan', label: 'Kecamatan' });
-      if (leafletMap.hasLayer(adminBoundaryLayers.kabkota)) active.push({ key: 'kabkota', label: 'Kab/Kota' });
-      if (!active.length) return;
-
-      const first = active[0];
-      const layer = adminBoundaryLayers[first.key];
-      if (!layer || !layer.toGeoJSON) return;
-
-      const feature = layer.toGeoJSON().features && layer.toGeoJSON().features[0];
-      const name = feature && feature.properties ? String(feature.properties.namobj || feature.properties.NAMOBJ || feature.properties.wadmkd || feature.properties.WADMKD || feature.properties.wadmkc || feature.properties.WADMKC || feature.properties.wadmkk || feature.properties.WADMKK || '').trim() : '';
-      if (!name) return;
-      L.popup({ maxWidth: 260 })
-        .setLatLng(e.latlng)
-        .setContent('<b style="font-size:13px;">' + escapeHtml(name) + '</b><br><span style="color:#888; font-size:11px;">' + escapeHtml(first.label) + '</span>')
-        .openOn(leafletMap);
-    });
+    const layerCtrl = L.control.layers(baseMapsCtrl, overlayCtrl, { position: 'topright', collapsed: true }).addTo(leafletMap);
 
     // ── MARKERS ─────────────────────────────────────────────────────────
     leafletMarkers = [];
@@ -4360,6 +4358,16 @@ button.project-btn:disabled{
       leafletMap.setView(bounds[0], 11);
     } else {
       leafletMap.fitBounds(bounds, { padding: [30,30] });
+    }
+
+    // ── Muat batas administrasi terfilter dari BIG (async, tidak memblokir render) ──
+    // adminComponents & adminLevel diambil dari lastAnalysis & mapAdminLevelSelect
+    if (lastAnalysis && lastAnalysis.adminComponents) {
+      loadAdminBoundaries(
+        lastAnalysis.adminComponents,
+        mapAdminLevelSelect.value || 'kecamatan',
+        layerCtrl
+      );
     }
 
     // build filterable legend
