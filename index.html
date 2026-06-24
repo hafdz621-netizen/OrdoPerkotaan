@@ -4360,24 +4360,64 @@ button.project-btn:disabled{
       return null;
     }
 
+    // ── Helper: bangun object parameter spatial extent (esriGeometryEnvelope) ────
+    // Mengembalikan { geometry, geometryType, spatialRel } yang bisa di-merge ke
+    // params queryBIGLayer lewat Object.assign — ringan (cukup 4 angka bbox, tidak
+    // butuh ribuan vertex), namun tetap membatasi scope spasial query agar desa
+    // dengan nama sama di luar kecamatan yang dianalisis tidak ikut terambil.
+    function buildExtentParams(geo) {
+      const bbox = featuresBbox(geo);
+      if (!bbox) return null;
+      return {
+        geometry: JSON.stringify({
+          xmin: bbox.xmin, ymin: bbox.ymin,
+          xmax: bbox.xmax, ymax: bbox.ymax,
+          spatialReference: { wkid: 4326 }
+        }),
+        geometryType: 'esriGeometryEnvelope',
+        spatialRel: 'esriSpatialRelIntersects'
+      };
+    }
+
     if (adminLevel === 'desa' && uniqueDesa.length > 0) {
-      // Level desa: tampilkan HANYA desa yang teranalisis
+      // Level desa: tampilkan HANYA desa yang teranalisis.
+      // Layer 4 (Desa) BIG hanya punya field "namobj" untuk nama wilayah — tidak ada
+      // WADMKD/WADMKC/WADMKK. Strategi: kombinasikan namobj IN (attribute query)
+      // dengan spatial extent kecamatan (bbox ringan, bukan vertex penuh) agar
+      // desa bernama sama di kecamatan lain tidak ikut terambil.
       showAdminMsg('Memuat batas Desa (teranalisis saja)…', 'loading');
       let desaData = null;
 
-      // ── STRATEGI UTAMA: query langsung via namobj IN (nama desa dari kolom identitas)
-      // Layer 4 (Desa) BIG hanya punya field "namobj" untuk nama wilayah — tidak ada
-      // WADMKD/WADMKC/WADMKK seperti layer Kecamatan. Karena kolom identitas data
-      // analisis sudah berisi nama desa, kita query namobj IN (uniqueDesa) langsung
-      // tanpa perlu spatial query yang berat. ──
+      const scopeKec = kecamatanGeo ? filterKecByAnalyzed(kecamatanGeo) : null;
+      const extentP  = scopeKec ? buildExtentParams(scopeKec) : null;
 
-      // A. Exact IN — semua nama desa sekaligus (satu request POST, paling cepat)
-      desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-        where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
-        outFields: DESA_OUT_FIELDS
-      });
+      // ── A. namobj IN + spatial extent (GABUNGAN — paling presisi) ────────────
+      // Satu request POST: attribute filter (nama desa tepat) + bbox kecamatan.
+      // Eliminasi desa homonym di kecamatan lain tanpa perlu vertex polygon.
+      if (extentP) {
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({
+          where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
+          outFields: DESA_OUT_FIELDS
+        }, extentP));
+      }
 
-      // B. LIKE fallback — toleran kapitalisasi & prefiks "Desa "/"Kelurahan "/dll
+      // ── B. namobj IN tanpa spatial (fallback jika server menolak kombinasi) ──
+      if (!desaData) {
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
+          where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
+          outFields: DESA_OUT_FIELDS
+        });
+      }
+
+      // ── C. LIKE + spatial extent (toleran prefiks "Desa "/"Kelurahan "/kapital) ─
+      if (!desaData && extentP) {
+        desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({
+          where: sqlLikeField('namobj', uniqueDesa),
+          outFields: DESA_OUT_FIELDS
+        }, extentP));
+      }
+
+      // ── D. LIKE tanpa spatial ─────────────────────────────────────────────────
       if (!desaData) {
         desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
           where: sqlLikeField('namobj', uniqueDesa),
@@ -4385,20 +4425,16 @@ button.project-btn:disabled{
         });
       }
 
-      // C. Spatial fallback via bbox kecamatan — cadangan jika nama di data tidak
-      //    cocok persis dengan namobj di server (beda ejaan, ada prefiks, dst.)
-      if (!desaData && kecamatanGeo) {
-        const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
-        if (scopeGeo) {
-          showAdminMsg('Memuat batas Desa (spatial bbox per kecamatan)…', 'loading');
-          desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
-          // Saring client-side ke nama desa yang dianalisis
-          if (desaData && uniqueDesa.length > 0) {
-            const filteredByName = desaData.features.filter(function(f) {
-              return uniqueDesa.some(function(d) { return fuzzyMatch(getBIGName(f), d); });
-            });
-            if (filteredByName.length > 0) desaData = { type: 'FeatureCollection', features: filteredByName };
-          }
+      // ── E. Spatial extent saja + saring client-side (cadangan terakhir) ──────
+      // Dipakai jika nama di data sama sekali tidak cocok dengan namobj server.
+      if (!desaData && scopeKec) {
+        showAdminMsg('Memuat batas Desa (spatial extent kecamatan, filter klien)…', 'loading');
+        desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeKec, DESA_OUT_FIELDS);
+        if (desaData && uniqueDesa.length > 0) {
+          const filteredByName = desaData.features.filter(function(f) {
+            return uniqueDesa.some(function(d) { return fuzzyMatch(getBIGName(f), d); });
+          });
+          if (filteredByName.length > 0) desaData = { type: 'FeatureCollection', features: filteredByName };
         }
       }
 
@@ -4408,39 +4444,28 @@ button.project-btn:disabled{
       } else { errorCount++; }
 
     } else if (adminLevel === 'kecamatan') {
-      // Level kecamatan: tampilkan desa dalam kecamatan yang dianalisis
-      // Layer Desa tidak punya WADMKC/WADMKK — satu-satunya pendekatan via namobj
-      // (nama identitas pada data) atau spatial bbox (jika nama tidak cocok).
+      // Level kecamatan: tampilkan semua desa dalam kecamatan yang dianalisis.
+      // Di mode ini kolom identitas berisi nama kecamatan (bukan desa), sehingga
+      // tidak bisa filter namobj; cukup pakai spatial extent kecamatan sebagai scope.
       if (uniqueKec.length > 0) {
         showAdminMsg('Memuat batas Desa dalam kecamatan teranalisis…', 'loading');
         let desaData = null;
 
-        // A. namobj IN (identitas wilayah) — di level kecamatan, identitas bisa berupa
-        //    nama kecamatan; jika desa-nya berbeda dari identitas, fallback spatial
-        //    di bawah yang akan mengambil semua desa dalam kecamatan tersebut.
-        if (uniqueDesa.length > 0) {
-          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-            where: 'namobj IN (' + sqlIn(uniqueDesa) + ')',
+        const scopeKec2 = kecamatanGeo ? filterKecByAnalyzed(kecamatanGeo) : null;
+        const extentP2  = scopeKec2 ? buildExtentParams(scopeKec2) : null;
+
+        // A. Spatial extent kecamatan teranalisis — semua desa dalam bbox tersebut
+        if (extentP2) {
+          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, Object.assign({
+            where: 'objectid > 0',
             outFields: DESA_OUT_FIELDS
-          });
+          }, extentP2));
         }
 
-        // B. LIKE fallback
-        if (!desaData && uniqueDesa.length > 0) {
-          desaData = await queryBIGLayer(BIG_LAYER_INDEX.desa, {
-            where: sqlLikeField('namobj', uniqueDesa),
-            outFields: DESA_OUT_FIELDS
-          });
-        }
-
-        // C. Spatial fallback (bbox kecamatan) — dipakai ketika identitas data adalah
-        //    nama kecamatan sehingga namobj query ke layer desa tidak menemukan hasil.
-        if (!desaData && kecamatanGeo) {
-          const scopeGeo = filterKecByAnalyzed(kecamatanGeo);
-          if (scopeGeo) {
-            showAdminMsg('Memuat batas Desa (spatial bbox per kecamatan teranalisis)…', 'loading');
-            desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeGeo, DESA_OUT_FIELDS);
-          }
+        // B. spatialQuery (bbox + fallback GET) jika A gagal
+        if (!desaData && scopeKec2) {
+          showAdminMsg('Memuat batas Desa (spatial extent kecamatan, fallback GET)…', 'loading');
+          desaData = await spatialQuery(BIG_LAYER_INDEX.desa, scopeKec2, DESA_OUT_FIELDS);
         }
 
         if (desaData) {
