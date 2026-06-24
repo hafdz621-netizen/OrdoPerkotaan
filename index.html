@@ -4010,7 +4010,7 @@ button.project-btn:disabled{
   // Warna batas administrasi (kab/kota & kecamatan; desa transparan)
   const ADMIN_STYLE_KAB  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 2.0 };
   const ADMIN_STYLE_KEC  = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 1.5 };
-  const ADMIN_STYLE_DESA = { fillColor: 'transparent', fillOpacity: 0, color: '#aaaaaa', weight: 0.8 };
+  const ADMIN_STYLE_DESA = { fillColor: '#00FFC5', fillOpacity: 0.2, color: '#A80000', weight: 1.0 };
 
   // ── Helper: query BIG via POST (menghindari batas panjang URL GET) ──────
   async function queryBIGLayer(layerIdx, params) {
@@ -4176,17 +4176,9 @@ button.project-btn:disabled{
         if (!kecData) kecData = await queryBIGLayer(BIG_LAYER_INDEX.kecamatan, { where: 'WADMKC IN (' + sqlIn(uniqueKec) + ')' });
       }
 
-      // ── B. Spatial fallback: kecamatan dalam bbox kabkota ─────────────────
-      // Dipakai jika: kolom Kecamatan kosong di data, atau nama tidak cocok dengan BIG
-      if (!kecData && kabkotaGeo) {
-        showAdminMsg('Memuat batas Kecamatan (spatial via Kab/Kota)…', 'loading');
-        kecData = await spatialQuery(BIG_LAYER_INDEX.kecamatan, kabkotaGeo);
-      }
-
       if (kecData) {
-        // Skala desa: tampilkan HANYA kecamatan yang teranalisis (bukan semua dalam kabkota)
-        // Skala kecamatan: simpan semua (spatial scope desa butuh lebih luas)
-        const kecToShow = (adminLevel === 'desa' && uniqueKec.length > 0)
+        // Selalu filter ke kecamatan yang dianalisis saja (bukan semua dalam kabkota)
+        const kecToShow = uniqueKec.length > 0
           ? (filterKecByAnalyzed(kecData) || kecData)
           : kecData;
         kecamatanGeo = kecToShow; // simpan versi yang sudah difilter
@@ -4343,7 +4335,7 @@ button.project-btn:disabled{
           chipDesa.className = 'map-legend-chip';
           chipDesa.style.cursor = 'default';
           chipDesa.innerHTML =
-            '<span class="dot" style="background:transparent;border:2px solid #aaaaaa;box-sizing:border-box;"></span>' +
+            '<span class="dot" style="background:rgba(0,255,197,0.2);border:2px solid #A80000;box-sizing:border-box;"></span>' +
             ' Batas Desa/Kel';
           legendEl.appendChild(chipDesa);
         }
