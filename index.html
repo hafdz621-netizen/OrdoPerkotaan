@@ -4184,8 +4184,13 @@ button.project-btn:disabled{
       }
 
       if (kecData) {
-        kecamatanGeo = kecData;
-        const lyr = makeBoundaryLayer(kecData, ADMIN_STYLE_KEC, 'Kecamatan');
+        // Skala desa: tampilkan HANYA kecamatan yang teranalisis (bukan semua dalam kabkota)
+        // Skala kecamatan: simpan semua (spatial scope desa butuh lebih luas)
+        const kecToShow = (adminLevel === 'desa' && uniqueKec.length > 0)
+          ? (filterKecByAnalyzed(kecData) || kecData)
+          : kecData;
+        kecamatanGeo = kecToShow; // simpan versi yang sudah difilter
+        const lyr = makeBoundaryLayer(kecToShow, ADMIN_STYLE_KEC, 'Kecamatan');
         if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E0; Batas Kecamatan'); loadedCount++; }
       } else { errorCount++; }
     }
@@ -4265,7 +4270,7 @@ button.project-btn:disabled{
       } else {
         // Final fallback: GitHub ZIP TopoJSON
         showAdminMsg('BIG desa gagal, mencoba GitHub TopoJSON…', 'loading');
-        const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo);
+        const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, uniqueDesa, adminLevel, kecamatanGeo);
         if (ghData) {
           const lyr = makeBoundaryLayer(ghData, ADMIN_STYLE_DESA, 'Desa/Kel (GitHub)');
           if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
@@ -4305,7 +4310,7 @@ button.project-btn:disabled{
         } else {
           // Final fallback: GitHub ZIP TopoJSON
           showAdminMsg('BIG desa gagal, mencoba GitHub TopoJSON…', 'loading');
-          const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo);
+          const ghData = await loadDesaFromGitHub(uniqueKec, uniqueKab, uniqueDesa, adminLevel, kecamatanGeo);
           if (ghData) {
             const lyr = makeBoundaryLayer(ghData, ADMIN_STYLE_DESA, 'Desa/Kel (GitHub)');
             if (lyr) { layerCtrl.addOverlay(lyr, '&#x1F7E2; Batas Desa/Kel'); loadedCount++; }
@@ -4361,7 +4366,7 @@ button.project-btn:disabled{
   // Dipakai jika BIG desa layer (layer 4) gagal di-query (CORS / field names).
   // ZIP berisi TopoJSON batas kelurahan/desa.
   // Return: GeoJSON FeatureCollection (terfilter kecamatan) atau null.
-  async function loadDesaFromGitHub(uniqueKec, uniqueKab, kecamatanGeo) {
+  async function loadDesaFromGitHub(uniqueKec, uniqueKab, uniqueDesa, adminLevel, kecamatanGeo) {
     let fullGeo = _desaGitHubCache;
 
     if (!fullGeo) {
@@ -4416,14 +4421,18 @@ button.project-btn:disabled{
       _desaGitHubCache = fullGeo; // cache agar tidak re-download sesi ini
     }
 
-    // 6. Filter ke kecamatan yang dianalisis
-    // Field kecamatan yang dicoba (BIG, BPS, GADM, format custom)
-    const KEC_FIELDS = ['WADMKC','wadmkc','KECAMATAN','kecamatan','KEC','kec','NAMKEC','namkec','NM_KEC','nm_kec','NAME_3','name_3'];
-    const KAB_FIELDS = ['WADMKK','wadmkk','KABKOT','kabkot','KABUPATEN','kabupaten','KAB','kab','NM_KAB','nm_kab','NAME_2','name_2'];
-    const kecLower = uniqueKec.map(k => k.toLowerCase().trim());
-    const kabLower = uniqueKab.map(k => k.toLowerCase().trim());
+    // 6. Filter hierarkis: WADMKK (kabkota) → WADMKC (kecamatan) → WADMKD (desa, jika level desa)
+    const kecLower  = uniqueKec.map(k  => k.toLowerCase().trim());
+    const kabLower  = uniqueKab.map(k  => k.toLowerCase().trim());
+    const desaLower = uniqueDesa.map(d => d.toLowerCase().trim());
 
-    // Helper: cek apakah bbox dua objek overlap (cepat, tanpa full polygon-in-polygon)
+    // Cek kecocokan nilai terhadap daftar (substring dua arah untuk handle singkatan/prefix)
+    function matchVal(val, list) {
+      const v = val.toLowerCase().trim();
+      return v.length > 0 && list.some(k => v === k || v.includes(k) || k.includes(v));
+    }
+
+    // Helper: bbox-overlap untuk spatial fallback
     function overlapsBbox(feature, bbox) {
       const coords = extractAllCoords(feature.geometry);
       if (!coords.length) return false;
@@ -4432,33 +4441,36 @@ button.project-btn:disabled{
       return !(xx < bbox.xmin || xn > bbox.xmax || yx < bbox.ymin || yn > bbox.ymax);
     }
 
-    // A. Filter by nama kecamatan (field-based, paling presisi)
-    if (kecLower.length > 0) {
+    // A. Filter hierarkis WADMKK → WADMKC → WADMKD
+    {
       const filtered = fullGeo.features.filter(f => {
         const p = f.properties || {};
-        // Opsional: batasi kabkota dulu (hindari nama kecamatan duplikat lintas kabkota)
+
+        // WADMKK (kabkota) — filter jika uniqueKab terisi dan field ada
         if (kabLower.length > 0) {
-          for (const kf of KAB_FIELDS) {
-            if (p[kf]) {
-              const v = String(p[kf]).toLowerCase().trim();
-              if (!kabLower.some(k => v.includes(k) || k.includes(v))) return false;
-              break;
-            }
-          }
+          const v = String(p.WADMKK || p.wadmkk || '');
+          if (v && !matchVal(v, kabLower)) return false;
+          // jika field kosong → loloskan (mungkin field tidak ada di data ini)
         }
-        // Cocokkan nama kecamatan
-        for (const kf of KEC_FIELDS) {
-          if (p[kf]) {
-            const v = String(p[kf]).toLowerCase().trim();
-            if (kecLower.some(k => v === k || v.includes(k) || k.includes(v))) return true;
-          }
+
+        // WADMKC (kecamatan) — wajib cocok jika uniqueKec terisi
+        if (kecLower.length > 0) {
+          const v = String(p.WADMKC || p.wadmkc || '');
+          if (!v || !matchVal(v, kecLower)) return false;
         }
-        return false;
+
+        // WADMKD (desa) — hanya jika level=desa dan uniqueDesa terisi
+        if (adminLevel === 'desa' && desaLower.length > 0) {
+          const v = String(p.WADMKD || p.wadmkd || '');
+          if (!v || !matchVal(v, desaLower)) return false;
+        }
+
+        return true;
       });
       if (filtered.length > 0) return { type: 'FeatureCollection', features: filtered };
     }
 
-    // B. Spatial fallback: filter by bbox kecamatanGeo (jika filter nama gagal)
+    // B. Spatial fallback: bbox kecamatanGeo (jika WADMK fields tidak ada/tidak cocok)
     if (kecamatanGeo) {
       const bbox = featuresBbox(kecamatanGeo);
       if (bbox) {
@@ -4467,7 +4479,6 @@ button.project-btn:disabled{
       }
     }
 
-    // Jangan return fullGeo tanpa filter (terlalu banyak fitur)
     console.warn('loadDesaFromGitHub: tidak ada fitur yang cocok setelah filter');
     return null;
   }
